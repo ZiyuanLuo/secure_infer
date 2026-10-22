@@ -1,0 +1,13 @@
+.env
+*.o
+*.d
+*.so
+__pycache__/
+*.pyc
+build/
+runs/
+*.log
+*.csv
+.cache/
+model/
+models/

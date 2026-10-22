@@ -1,0 +1,1068 @@
+#include "aicpu_api.h"
+#include "ghash_shared.h"
+#include <arm_neon.h>
+
+#ifndef PIPE_AICPU_AES_INTERLEAVE
+#define PIPE_AICPU_AES_INTERLEAVE 4
+#endif
+
+// Four-way polynomial folding is the single-AICPU precursor to SCALE-style
+// multi-chaining.  It preserves the standard GHASH polynomial exactly, but
+// turns four dependent H multiplications into four independent products so
+// the PMULL pipeline can overlap them.  Four is the validated serving
+// default on this Ascend AICPU; wider folds are intentionally not enabled.
+#ifndef PIPE_AICPU_GHASH_FOLD
+#define PIPE_AICPU_GHASH_FOLD 1
+#endif
+
+// A SCALE-style algebraic alternative to the ordinary folded recurrence.
+// Four interleaved chains use H^4 and are reduced only at the end.  It is off
+// by default while we measure whether the extra live accumulators help this
+// particular AICPU compiler/PMULL pipeline.
+#ifndef PIPE_AICPU_GHASH_MULTICHAIN
+#define PIPE_AICPU_GHASH_MULTICHAIN 0
+#endif
+
+#if PIPE_AICPU_AES_INTERLEAVE != 1 && PIPE_AICPU_AES_INTERLEAVE != 4
+#error "PIPE_AICPU_AES_INTERLEAVE must be 1 or 4"
+#endif
+
+#if PIPE_AICPU_GHASH_FOLD != 1 && PIPE_AICPU_GHASH_FOLD != 4 && \
+    PIPE_AICPU_GHASH_FOLD != 8
+#error "PIPE_AICPU_GHASH_FOLD must be 1, 4, or 8"
+#endif
+
+#if PIPE_AICPU_GHASH_MULTICHAIN != 0 && PIPE_AICPU_GHASH_MULTICHAIN != 4
+#error "PIPE_AICPU_GHASH_MULTICHAIN must be 0 or 4"
+#endif
+
+namespace {
+
+static const uint8_t kAesSbox[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+};
+
+static inline void aes128_expand_key(const uint8_t key[16],
+                                     uint8_t expanded[176])
+{
+    for (uint32_t i = 0; i < 16; ++i) expanded[i] = key[i];
+    uint32_t generated = 16;
+    uint8_t rcon = 1;
+    while (generated < 176) {
+        uint8_t temp[4];
+        for (uint32_t i = 0; i < 4; ++i) temp[i] = expanded[generated - 4 + i];
+        if ((generated & 15U) == 0) {
+            const uint8_t first = temp[0];
+            temp[0] = kAesSbox[temp[1]];
+            temp[1] = kAesSbox[temp[2]];
+            temp[2] = kAesSbox[temp[3]];
+            temp[3] = kAesSbox[first];
+            temp[0] ^= rcon;
+            rcon = static_cast<uint8_t>((rcon << 1) ^
+                ((rcon & 0x80U) != 0 ? 0x1bU : 0U));
+        }
+        for (uint32_t i = 0; i < 4; ++i) {
+            expanded[generated] =
+                static_cast<uint8_t>(expanded[generated - 16] ^ temp[i]);
+            ++generated;
+        }
+    }
+}
+
+static inline uint8x16_t aes128_encrypt_block(
+    uint8x16_t block, const uint8_t expanded[176])
+{
+    for (uint32_t round = 0; round < 9; ++round) {
+        const uint8x16_t round_key = vld1q_u8(expanded + round * 16);
+        __asm__ volatile("aese %0.16b, %1.16b"
+                         : "+w"(block) : "w"(round_key));
+        __asm__ volatile("aesmc %0.16b, %0.16b" : "+w"(block));
+    }
+    const uint8x16_t round_key9 = vld1q_u8(expanded + 9 * 16);
+    __asm__ volatile("aese %0.16b, %1.16b"
+                     : "+w"(block) : "w"(round_key9));
+    return veorq_u8(block, vld1q_u8(expanded + 10 * 16));
+}
+
+// CTR blocks are independent.  Interleaving four blocks keeps several AES
+// instruction dependency chains in flight, rather than waiting for all ten
+// rounds of one block before issuing the next block's first round.
+static inline void aes128_encrypt_four_blocks(
+    uint8x16_t& block0, uint8x16_t& block1,
+    uint8x16_t& block2, uint8x16_t& block3,
+    const uint8_t expanded[176])
+{
+    for (uint32_t round = 0; round < 9; ++round) {
+        const uint8x16_t round_key = vld1q_u8(expanded + round * 16);
+        __asm__ volatile("aese %0.16b, %1.16b" : "+w"(block0) : "w"(round_key));
+        __asm__ volatile("aese %0.16b, %1.16b" : "+w"(block1) : "w"(round_key));
+        __asm__ volatile("aese %0.16b, %1.16b" : "+w"(block2) : "w"(round_key));
+        __asm__ volatile("aese %0.16b, %1.16b" : "+w"(block3) : "w"(round_key));
+        __asm__ volatile("aesmc %0.16b, %0.16b" : "+w"(block0));
+        __asm__ volatile("aesmc %0.16b, %0.16b" : "+w"(block1));
+        __asm__ volatile("aesmc %0.16b, %0.16b" : "+w"(block2));
+        __asm__ volatile("aesmc %0.16b, %0.16b" : "+w"(block3));
+    }
+    const uint8x16_t round_key9 = vld1q_u8(expanded + 9 * 16);
+    __asm__ volatile("aese %0.16b, %1.16b" : "+w"(block0) : "w"(round_key9));
+    __asm__ volatile("aese %0.16b, %1.16b" : "+w"(block1) : "w"(round_key9));
+    __asm__ volatile("aese %0.16b, %1.16b" : "+w"(block2) : "w"(round_key9));
+    __asm__ volatile("aese %0.16b, %1.16b" : "+w"(block3) : "w"(round_key9));
+    const uint8x16_t final_key = vld1q_u8(expanded + 10 * 16);
+    block0 = veorq_u8(block0, final_key);
+    block1 = veorq_u8(block1, final_key);
+    block2 = veorq_u8(block2, final_key);
+    block3 = veorq_u8(block3, final_key);
+}
+
+static inline void make_counter_block(
+    uint8_t counter_block[16], const uint32_t iv_words[4], uint32_t counter)
+{
+    for (uint32_t word = 0; word < 3; ++word) {
+        const uint32_t value = iv_words[word];
+        counter_block[word * 4 + 0] = static_cast<uint8_t>(value >> 24);
+        counter_block[word * 4 + 1] = static_cast<uint8_t>(value >> 16);
+        counter_block[word * 4 + 2] = static_cast<uint8_t>(value >> 8);
+        counter_block[word * 4 + 3] = static_cast<uint8_t>(value);
+    }
+    counter_block[12] = static_cast<uint8_t>(counter >> 24);
+    counter_block[13] = static_cast<uint8_t>(counter >> 16);
+    counter_block[14] = static_cast<uint8_t>(counter >> 8);
+    counter_block[15] = static_cast<uint8_t>(counter);
+}
+
+template <bool kKeyStreamOnly>
+static inline void store_full_block(
+    const uint8_t* input, uint8_t* output, const uint8x16_t key_stream)
+{
+    if (kKeyStreamOnly) {
+        vst1q_u8(output, key_stream);
+    } else {
+        const uint8x16_t plain = vld1q_u8(input);
+        vst1q_u8(output, veorq_u8(plain, key_stream));
+    }
+}
+
+template <bool kKeyStreamOnly>
+static inline void store_tail(
+    const uint8_t* input, uint8_t* output, const uint8x16_t key_stream,
+    uint64_t bytes)
+{
+    uint8_t key_bytes[16];
+    vst1q_u8(key_bytes, key_stream);
+    for (uint64_t i = 0; i < bytes; ++i) {
+        output[i] = kKeyStreamOnly ? key_bytes[i] :
+            static_cast<uint8_t>(input[i] ^ key_bytes[i]);
+    }
+}
+
+template <bool kKeyStreamOnly>
+static inline void aes128_ctr_process(
+    const uint8_t* input, uint8_t* output, uint64_t bytes,
+    const uint8_t expanded[176], const uint32_t iv_words[4])
+{
+    uint64_t offset = 0;
+    uint32_t counter = iv_words[3];
+
+#if PIPE_AICPU_AES_INTERLEAVE == 4
+    while (bytes - offset >= 64) {
+        uint8_t counter0[16];
+        uint8_t counter1[16];
+        uint8_t counter2[16];
+        uint8_t counter3[16];
+        make_counter_block(counter0, iv_words, counter++);
+        make_counter_block(counter1, iv_words, counter++);
+        make_counter_block(counter2, iv_words, counter++);
+        make_counter_block(counter3, iv_words, counter++);
+        uint8x16_t block0 = vld1q_u8(counter0);
+        uint8x16_t block1 = vld1q_u8(counter1);
+        uint8x16_t block2 = vld1q_u8(counter2);
+        uint8x16_t block3 = vld1q_u8(counter3);
+        aes128_encrypt_four_blocks(block0, block1, block2, block3, expanded);
+        store_full_block<kKeyStreamOnly>(input + offset, output + offset, block0);
+        store_full_block<kKeyStreamOnly>(input + offset + 16, output + offset + 16, block1);
+        store_full_block<kKeyStreamOnly>(input + offset + 32, output + offset + 32, block2);
+        store_full_block<kKeyStreamOnly>(input + offset + 48, output + offset + 48, block3);
+        offset += 64;
+    }
+#endif
+
+    while (offset < bytes) {
+        uint8_t counter_block[16];
+        make_counter_block(counter_block, iv_words, counter++);
+        const uint8x16_t key_stream = aes128_encrypt_block(
+            vld1q_u8(counter_block), expanded);
+        uint64_t take = bytes - offset;
+        if (take > 16) take = 16;
+        if (take == 16) {
+            store_full_block<kKeyStreamOnly>(
+                input + offset, output + offset, key_stream);
+        } else {
+            store_tail<kKeyStreamOnly>(
+                input + offset, output + offset, key_stream, take);
+        }
+        offset += take;
+    }
+}
+
+static inline void xor_block(uint8_t dst[16], const uint8_t src[16])
+{
+    for (uint32_t i = 0; i < 16; ++i) dst[i] ^= src[i];
+}
+
+// Carry-less multiply using the AICPU ARMv8 PMULL unit. GHASH's bit ordering
+// is the reverse of the polynomial convention used by PMULL, so vrbit maps
+// each input byte into the internal representation and maps the result back.
+// The reduction polynomial is x^128 + x^7 + x^2 + x + 1.
+// H is constant for every block in a GCM message.  Preparing its
+// bit-reversed PMULL representation once removes two vector transforms and
+// two lane extracts from the inner GHASH loop.
+struct GhashPreparedKey {
+    uint64_t y0;
+    uint64_t y1;
+};
+
+static inline GhashPreparedKey ghash_prepare_key_vec(const uint8x16_t h)
+{
+    const uint8x16_t reversed = vrbitq_u8(h);
+    const uint64x2_t words = vreinterpretq_u64_u8(reversed);
+    return {vgetq_lane_u64(words, 0), vgetq_lane_u64(words, 1)};
+}
+
+static inline GhashPreparedKey ghash_prepare_key(const uint8_t h[16])
+{
+    return ghash_prepare_key_vec(vld1q_u8(h));
+}
+
+static inline uint8x16_t ghash_prepared_key_value(const GhashPreparedKey& h)
+{
+    uint64x2_t words = vdupq_n_u64(0);
+    words = vsetq_lane_u64(h.y0, words, 0);
+    words = vsetq_lane_u64(h.y1, words, 1);
+    return vrbitq_u8(vreinterpretq_u8_u64(words));
+}
+
+// The PMULL representation is the bit-reversed GHASH representation.  The
+// public helpers above deliberately hide that detail, but a long GHASH walk
+// should not repeatedly convert its accumulator to the public byte order and
+// straight back again.  Keep the accumulator in this representation until the
+// final tag comparison.  Ciphertext blocks still need one conversion at their
+// load boundary, which is unavoidable with standard GCM byte ordering.
+static inline uint8x16_t ghash_prepared_key_internal_value(
+    const GhashPreparedKey& h)
+{
+    uint64x2_t words = vdupq_n_u64(0);
+    words = vsetq_lane_u64(h.y0, words, 0);
+    words = vsetq_lane_u64(h.y1, words, 1);
+    return vreinterpretq_u8_u64(words);
+}
+
+static inline GhashPreparedKey ghash_prepare_internal_key_vec(
+    const uint8x16_t internal)
+{
+    const uint64x2_t words = vreinterpretq_u64_u8(internal);
+    return {vgetq_lane_u64(words, 0), vgetq_lane_u64(words, 1)};
+}
+
+// Keep the GHASH accumulator in a NEON register.  The former ABI-shaped
+// helper accepted and returned byte arrays, which made each 16-byte GHASH
+// block materialize `state` and `product` in stack memory.  That is harmless
+// for correctness but costly for the single-chain hot loop: each multiply
+// then carries two avoidable vector stores and reloads in addition to PMULL.
+//
+// This vector form is deliberately the primitive used by the hot path below;
+// the byte-array wrapper remains only for the few cold call sites that need a
+// serialized tag.  It preserves exactly the same bit ordering and reduction
+// polynomial as the original PMULL implementation.
+static inline uint8x16_t gf128_mul_prepared_internal_vec(
+    const uint8x16_t internal_x, const GhashPreparedKey& y)
+{
+    const uint64x2_t xu = vreinterpretq_u64_u8(internal_x);
+    const uint64_t x0 = vgetq_lane_u64(xu, 0);
+    const uint64_t x1 = vgetq_lane_u64(xu, 1);
+
+    const __uint128_t p0 = static_cast<__uint128_t>(
+        vmull_p64(static_cast<poly64_t>(x0), static_cast<poly64_t>(y.y0)));
+    const __uint128_t p3 = static_cast<__uint128_t>(
+        vmull_p64(static_cast<poly64_t>(x1), static_cast<poly64_t>(y.y1)));
+    __uint128_t cross = static_cast<__uint128_t>(
+        vmull_p64(static_cast<poly64_t>(x0 ^ x1),
+                  static_cast<poly64_t>(y.y0 ^ y.y1)));
+    cross ^= p0 ^ p3;
+
+    const __uint128_t low = p0 ^ (cross << 64);
+    const __uint128_t high = p3 ^ (cross >> 64);
+    const __uint128_t overflow =
+        (high >> 127) ^ (high >> 126) ^ (high >> 121);
+    const __uint128_t reduced =
+        low ^ high ^ (high << 1) ^ (high << 2) ^ (high << 7) ^
+        overflow ^ (overflow << 1) ^ (overflow << 2) ^ (overflow << 7);
+
+    uint64x2_t result = vdupq_n_u64(0);
+    result = vsetq_lane_u64(static_cast<uint64_t>(reduced), result, 0);
+    result = vsetq_lane_u64(static_cast<uint64_t>(reduced >> 64), result, 1);
+    return vreinterpretq_u8_u64(result);
+}
+
+static inline uint8x16_t gf128_mul_prepared_vec(const uint8x16_t x,
+                                                const GhashPreparedKey& y)
+{
+    return vrbitq_u8(gf128_mul_prepared_internal_vec(vrbitq_u8(x), y));
+}
+
+static inline void gf128_mul_prepared(const uint8_t x[16],
+                                      const GhashPreparedKey& y,
+                                      uint8_t out[16])
+{
+    vst1q_u8(out, gf128_mul_prepared_vec(vld1q_u8(x), y));
+}
+
+// Update an already-register-resident GHASH accumulator.  This is the form
+// used for GCM verification: ciphertext, optional AAD, and the final length
+// block can all be folded without spilling the chain state between calls.
+static inline uint8x16_t ghash_update_prepared_vec(uint8x16_t state,
+                                                   const GhashPreparedKey& h,
+                                                   const uint8_t* data,
+                                                   uint64_t bytes)
+{
+    uint64_t offset = 0;
+    // `state` is part of the external GHASH ABI.  Convert it once at entry,
+    // retain it in PMULL order through the complete input span, and convert
+    // only once on return.  Previously every 16-byte multiplication paid two
+    // extra vrbit instructions (result out, next input back in).
+    state = vrbitq_u8(state);
+    // KV tensors are normally 16-byte aligned.  Do not materialize a stack
+    // block or copy sixteen bytes for that overwhelmingly common case.
+    const uint64_t full_bytes = bytes & ~static_cast<uint64_t>(15);
+#if PIPE_AICPU_GHASH_MULTICHAIN == 4
+    // Four-chain GHASH for a zero initial state and an integral number of
+    // four-block groups.  Let C_{4t+j} be the j-th block in group t and let
+    //
+    //   Z_j <- (Z_j * H^4) xor C_{4t+j}.
+    //
+    // After M groups the ordinary GHASH polynomial is exactly
+    //
+    //   Z_0 H^4 xor Z_1 H^3 xor Z_2 H^2 xor Z_3 H.
+    //
+    // This is not a weakened or reordered authenticator: it is a different
+    // parenthesization of the same polynomial.  In contrast to 4-way fold,
+    // the four recurring accumulators are independent across the *whole*
+    // message, giving a PMULL scheduler four long dependency chains to hide
+    // multiply latency.  The generic (non-zero-state / tail) path below is
+    // retained for AAD and arbitrary callers.
+    const uint64x2_t input_state = vreinterpretq_u64_u8(state);
+    const bool zero_state = vgetq_lane_u64(input_state, 0) == 0 &&
+                            vgetq_lane_u64(input_state, 1) == 0;
+    if (zero_state && full_bytes == bytes && (full_bytes & 63U) == 0 &&
+        full_bytes != 0) {
+        const uint8x16_t h_value = ghash_prepared_key_internal_value(h);
+        const uint8x16_t h2_value = gf128_mul_prepared_internal_vec(h_value, h);
+        const GhashPreparedKey h2 = ghash_prepare_internal_key_vec(h2_value);
+        const uint8x16_t h3_value = gf128_mul_prepared_internal_vec(h2_value, h);
+        const GhashPreparedKey h3 = ghash_prepare_internal_key_vec(h3_value);
+        const uint8x16_t h4_value = gf128_mul_prepared_internal_vec(h3_value, h);
+        const GhashPreparedKey h4 = ghash_prepare_internal_key_vec(h4_value);
+
+        uint8x16_t z0 = vdupq_n_u8(0);
+        uint8x16_t z1 = vdupq_n_u8(0);
+        uint8x16_t z2 = vdupq_n_u8(0);
+        uint8x16_t z3 = vdupq_n_u8(0);
+        while (offset < full_bytes) {
+            const uint8x16_t c0 = vrbitq_u8(vld1q_u8(data + offset));
+            const uint8x16_t c1 = vrbitq_u8(vld1q_u8(data + offset + 16));
+            const uint8x16_t c2 = vrbitq_u8(vld1q_u8(data + offset + 32));
+            const uint8x16_t c3 = vrbitq_u8(vld1q_u8(data + offset + 48));
+            z0 = veorq_u8(gf128_mul_prepared_internal_vec(z0, h4), c0);
+            z1 = veorq_u8(gf128_mul_prepared_internal_vec(z1, h4), c1);
+            z2 = veorq_u8(gf128_mul_prepared_internal_vec(z2, h4), c2);
+            z3 = veorq_u8(gf128_mul_prepared_internal_vec(z3, h4), c3);
+            offset += 64;
+        }
+        state = veorq_u8(
+            veorq_u8(gf128_mul_prepared_internal_vec(z0, h4),
+                      gf128_mul_prepared_internal_vec(z1, h3)),
+            veorq_u8(gf128_mul_prepared_internal_vec(z2, h2),
+                      gf128_mul_prepared_internal_vec(z3, h)));
+        return vrbitq_u8(state);
+    }
+#endif
+#if PIPE_AICPU_GHASH_FOLD == 8
+    // Eight-way polynomial folding is useful on long KV slices when the
+    // AICPU PMULL latency exceeds its issue interval.  It is exactly the same
+    // GHASH polynomial:
+    //   (S xor C0)H^8 xor C1H^7 ... xor C7H.
+    // No authentication chain, nonce, or tag format is changed.
+    const uint64_t folded_bytes = full_bytes & ~static_cast<uint64_t>(127);
+    if (folded_bytes != 0) {
+        const uint8x16_t h1_value = ghash_prepared_key_internal_value(h);
+        const uint8x16_t h2_value = gf128_mul_prepared_internal_vec(h1_value, h);
+        const GhashPreparedKey h2 = ghash_prepare_internal_key_vec(h2_value);
+        const uint8x16_t h3_value = gf128_mul_prepared_internal_vec(h2_value, h);
+        const GhashPreparedKey h3 = ghash_prepare_internal_key_vec(h3_value);
+        const uint8x16_t h4_value = gf128_mul_prepared_internal_vec(h3_value, h);
+        const GhashPreparedKey h4 = ghash_prepare_internal_key_vec(h4_value);
+        const uint8x16_t h5_value = gf128_mul_prepared_internal_vec(h4_value, h);
+        const GhashPreparedKey h5 = ghash_prepare_internal_key_vec(h5_value);
+        const uint8x16_t h6_value = gf128_mul_prepared_internal_vec(h5_value, h);
+        const GhashPreparedKey h6 = ghash_prepare_internal_key_vec(h6_value);
+        const uint8x16_t h7_value = gf128_mul_prepared_internal_vec(h6_value, h);
+        const GhashPreparedKey h7 = ghash_prepare_internal_key_vec(h7_value);
+        const uint8x16_t h8_value = gf128_mul_prepared_internal_vec(h7_value, h);
+        const GhashPreparedKey h8 = ghash_prepare_internal_key_vec(h8_value);
+        while (offset < folded_bytes) {
+            const uint8x16_t c0 = vrbitq_u8(vld1q_u8(data + offset));
+            const uint8x16_t c1 = vrbitq_u8(vld1q_u8(data + offset + 16));
+            const uint8x16_t c2 = vrbitq_u8(vld1q_u8(data + offset + 32));
+            const uint8x16_t c3 = vrbitq_u8(vld1q_u8(data + offset + 48));
+            const uint8x16_t c4 = vrbitq_u8(vld1q_u8(data + offset + 64));
+            const uint8x16_t c5 = vrbitq_u8(vld1q_u8(data + offset + 80));
+            const uint8x16_t c6 = vrbitq_u8(vld1q_u8(data + offset + 96));
+            const uint8x16_t c7 = vrbitq_u8(vld1q_u8(data + offset + 112));
+            const uint8x16_t p0 = gf128_mul_prepared_internal_vec(
+                veorq_u8(state, c0), h8);
+            const uint8x16_t p1 = gf128_mul_prepared_internal_vec(c1, h7);
+            const uint8x16_t p2 = gf128_mul_prepared_internal_vec(c2, h6);
+            const uint8x16_t p3 = gf128_mul_prepared_internal_vec(c3, h5);
+            const uint8x16_t p4 = gf128_mul_prepared_internal_vec(c4, h4);
+            const uint8x16_t p5 = gf128_mul_prepared_internal_vec(c5, h3);
+            const uint8x16_t p6 = gf128_mul_prepared_internal_vec(c6, h2);
+            const uint8x16_t p7 = gf128_mul_prepared_internal_vec(c7, h);
+            state = veorq_u8(
+                veorq_u8(veorq_u8(p0, p1), veorq_u8(p2, p3)),
+                veorq_u8(veorq_u8(p4, p5), veorq_u8(p6, p7)));
+            offset += 128;
+        }
+    }
+#elif PIPE_AICPU_GHASH_FOLD == 4
+    // For four full ciphertext blocks C0..C3, ordinary GHASH computes
+    //
+    //   ((((S xor C0) H xor C1) H xor C2) H xor C3) H
+    // = (S xor C0) H^4 xor C1 H^3 xor C2 H^2 xor C3 H.
+    //
+    // The right-hand products are independent.  This keeps the exact GCM
+    // tag while exposing PMULL-level instruction parallelism without ever
+    // releasing plaintext before the final authentication comparison.
+    const uint64_t folded_bytes = full_bytes & ~static_cast<uint64_t>(63);
+    if (folded_bytes != 0) {
+        const uint8x16_t h_value = ghash_prepared_key_internal_value(h);
+        const uint8x16_t h2_value = gf128_mul_prepared_internal_vec(h_value, h);
+        const GhashPreparedKey h2 = ghash_prepare_internal_key_vec(h2_value);
+        const uint8x16_t h3_value = gf128_mul_prepared_internal_vec(h2_value, h);
+        const GhashPreparedKey h3 = ghash_prepare_internal_key_vec(h3_value);
+        const uint8x16_t h4_value = gf128_mul_prepared_internal_vec(h3_value, h);
+        const GhashPreparedKey h4 = ghash_prepare_internal_key_vec(h4_value);
+        while (offset < folded_bytes) {
+            const uint8x16_t c0 = vrbitq_u8(vld1q_u8(data + offset));
+            const uint8x16_t c1 = vrbitq_u8(vld1q_u8(data + offset + 16));
+            const uint8x16_t c2 = vrbitq_u8(vld1q_u8(data + offset + 32));
+            const uint8x16_t c3 = vrbitq_u8(vld1q_u8(data + offset + 48));
+            const uint8x16_t p0 = gf128_mul_prepared_internal_vec(veorq_u8(state, c0), h4);
+            const uint8x16_t p1 = gf128_mul_prepared_internal_vec(c1, h3);
+            const uint8x16_t p2 = gf128_mul_prepared_internal_vec(c2, h2);
+            const uint8x16_t p3 = gf128_mul_prepared_internal_vec(c3, h);
+            state = veorq_u8(veorq_u8(p0, p1), veorq_u8(p2, p3));
+            offset += 64;
+        }
+    }
+#endif
+    while (offset < full_bytes) {
+        state = gf128_mul_prepared_internal_vec(
+            veorq_u8(state, vrbitq_u8(vld1q_u8(data + offset))), h);
+        offset += 16;
+    }
+    if (offset < bytes) {
+        uint8_t block[16] = {0};
+        uint64_t take = bytes - offset;
+        for (uint64_t i = 0; i < take; ++i) block[i] = data[offset + i];
+        state = gf128_mul_prepared_internal_vec(
+            veorq_u8(state, vrbitq_u8(vld1q_u8(block))), h);
+    }
+    return vrbitq_u8(state);
+}
+
+static inline void ghash_update_prepared(uint8_t state[16],
+                                         const GhashPreparedKey& h,
+                                         const uint8_t* data,
+                                         uint64_t bytes)
+{
+    const uint8x16_t updated = ghash_update_prepared_vec(
+        vld1q_u8(state), h, data, bytes);
+    vst1q_u8(state, updated);
+}
+
+static inline void store_be64(uint8_t* out, uint64_t value)
+{
+    for (uint32_t i = 0; i < 8; ++i) {
+        out[i] = static_cast<uint8_t>(value >> (56 - i * 8));
+    }
+}
+
+}  // namespace
+
+__global__ __aicpu__ uint32_t secure_infer_aes_ctr(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeAesCtrArgs*>(opaque);
+    const auto* input = reinterpret_cast<const uint8_t*>(args->input);
+    const auto* key = reinterpret_cast<const uint8_t*>(args->key);
+    auto* output = reinterpret_cast<uint8_t*>(args->output);
+    if (input == nullptr || key == nullptr || output == nullptr ||
+        args->bytes == 0) {
+        return 2;
+    }
+
+    uint8_t expanded[176];
+    aes128_expand_key(key, expanded);
+    aes128_ctr_process<false>(input, output, args->bytes, expanded,
+                               args->iv_words);
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+__global__ __aicpu__ uint32_t secure_infer_aes_keystream(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeAesKeystreamArgs*>(opaque);
+    const auto* key = reinterpret_cast<const uint8_t*>(args->key);
+    auto* output = reinterpret_cast<uint8_t*>(args->output);
+    if (key == nullptr || output == nullptr || args->bytes == 0) return 2;
+
+    uint8_t expanded[176];
+    aes128_expand_key(key, expanded);
+    // Pass output as the unused input pointer so no null pointer arithmetic is
+    // formed in the templated loop.  The kKeyStreamOnly specialization never
+    // loads from it.
+    aes128_ctr_process<true>(output, output, args->bytes, expanded,
+                              args->iv_words);
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Multi-IV background generation.  Each logical ticket intentionally keeps
+// its own nonce and output allocation; batching affects only launch and key
+// setup overhead, never the AES-GCM counter-space separation.
+__global__ __aicpu__ uint32_t secure_infer_aes_keystream_batch(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeAesKeystreamBatchArgs*>(opaque);
+    const auto* key = reinterpret_cast<const uint8_t*>(args->key);
+    if (key == nullptr || args->bytes == 0 || args->count == 0 ||
+        args->count > PIPE_AES_KEYSTREAM_BATCH_MAX) {
+        return 2;
+    }
+
+    // All tickets in this descriptor use the same device-resident AES key.
+    // Expand it once, then process their independent counters sequentially on
+    // the AICPU core.  This preserves exact per-ticket AES-CTR semantics.
+    uint8_t expanded[176];
+    aes128_expand_key(key, expanded);
+    for (uint32_t index = 0; index < args->count; ++index) {
+        auto* output = reinterpret_cast<uint8_t*>(args->outputs[index]);
+        if (output == nullptr) return 3;
+        aes128_ctr_process<true>(output, output, args->bytes, expanded,
+                                 args->iv_words[index]);
+    }
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Verified H2D AES-GCM release.  The old serving path scheduled four AICPU
+// tasks per physical KV slice: AES(E_K(J0)) for the tag mask, GHASH, AES-CTR,
+// and a separate output gate.  Apart from launch/queue overhead it expanded
+// the AES key twice and streamed the plaintext once more just to mask it.
+//
+// Keep authentication and decryption together.  The task always performs
+// CTR work (avoids creating a tag-validity timing oracle), then masks its
+// private staging output when verification fails.  The caller enqueues the
+// D2D copy to the model-visible KV cache only after this task on the same
+// stream, preserving the authenticated-release invariant.
+__global__ __aicpu__ uint32_t secure_infer_gcm_decrypt_verify(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeGcmDecryptVerifyArgs*>(opaque);
+    const auto* ciphertext = reinterpret_cast<const uint8_t*>(args->ciphertext);
+    const auto* key = reinterpret_cast<const uint8_t*>(args->key);
+    const auto* h = reinterpret_cast<const uint8_t*>(args->hash_subkey);
+    const auto* expected = reinterpret_cast<const uint8_t*>(args->expected_tag);
+    const auto* aad = reinterpret_cast<const uint8_t*>(args->aad);
+    auto* plaintext = reinterpret_cast<uint8_t*>(args->plaintext_output);
+    auto* status = reinterpret_cast<uint32_t*>(args->status_output);
+    if (ciphertext == nullptr || key == nullptr || h == nullptr ||
+        expected == nullptr || plaintext == nullptr || status == nullptr ||
+        args->bytes == 0 || (args->aad_bytes != 0 && aad == nullptr) ||
+        args->aad_bytes > UINT64_MAX / 8U) {
+        return 2;
+    }
+
+    uint8_t expanded[176];
+    aes128_expand_key(key, expanded);
+
+    // The payload counter starts at nonce||2.  For a 96-bit GCM nonce,
+    // J0=nonce||1 and the authentication mask is E_K(J0).
+    uint8_t j0[16];
+    make_counter_block(j0, args->iv_words, 1U);
+    uint8_t tag_mask[16];
+    vst1q_u8(tag_mask, aes128_encrypt_block(vld1q_u8(j0), expanded));
+
+    const GhashPreparedKey prepared_h = ghash_prepare_key(h);
+    uint8x16_t state = vdupq_n_u8(0);
+    if (args->aad_bytes != 0) {
+        state = ghash_update_prepared_vec(state, prepared_h, aad,
+                                          args->aad_bytes);
+    }
+    state = ghash_update_prepared_vec(state, prepared_h, ciphertext,
+                                      args->bytes);
+    uint8_t length_block[16];
+    store_be64(length_block, args->aad_bytes * 8U);
+    store_be64(length_block + 8, args->bytes * 8U);
+    uint8_t product[16];
+    vst1q_u8(product, gf128_mul_prepared_vec(
+        veorq_u8(state, vld1q_u8(length_block)), prepared_h));
+
+    uint8_t difference = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+        difference |= static_cast<uint8_t>((product[i] ^ tag_mask[i]) ^
+                                            expected[i]);
+    }
+    const uint32_t authenticated = difference == 0 ? 1U : 0U;
+
+    aes128_ctr_process<false>(ciphertext, plaintext, args->bytes, expanded,
+                               args->iv_words);
+    const uint8_t mask = static_cast<uint8_t>(0U - authenticated);
+    for (uint64_t i = 0; i < args->bytes; ++i) plaintext[i] &= mask;
+    *status = authenticated;
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Fused D2H protection.  The ciphertext is produced before GHASH reads it,
+// then the final tag is written to a separate 16-byte output.  D2H host
+// publication remains gated by the existing host-side AES-GCM verification.
+__global__ __aicpu__ uint32_t secure_infer_gcm_encrypt_tag(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeGcmEncryptTagArgs*>(opaque);
+    const auto* plaintext = reinterpret_cast<const uint8_t*>(args->plaintext);
+    const auto* key = reinterpret_cast<const uint8_t*>(args->key);
+    const auto* h = reinterpret_cast<const uint8_t*>(args->hash_subkey);
+    const auto* aad = reinterpret_cast<const uint8_t*>(args->aad);
+    auto* ciphertext = reinterpret_cast<uint8_t*>(args->ciphertext_output);
+    auto* tag = reinterpret_cast<uint8_t*>(args->tag_output);
+    if (plaintext == nullptr || key == nullptr || h == nullptr ||
+        ciphertext == nullptr || tag == nullptr || args->bytes == 0 ||
+        (args->aad_bytes != 0 && aad == nullptr) ||
+        args->aad_bytes > UINT64_MAX / 8U) {
+        return 2;
+    }
+
+    uint8_t expanded[176];
+    aes128_expand_key(key, expanded);
+    aes128_ctr_process<false>(plaintext, ciphertext, args->bytes, expanded,
+                               args->iv_words);
+
+    uint8_t j0[16];
+    make_counter_block(j0, args->iv_words, 1U);
+    uint8_t tag_mask[16];
+    vst1q_u8(tag_mask, aes128_encrypt_block(vld1q_u8(j0), expanded));
+
+    const GhashPreparedKey prepared_h = ghash_prepare_key(h);
+    uint8x16_t state = vdupq_n_u8(0);
+    if (args->aad_bytes != 0) {
+        state = ghash_update_prepared_vec(state, prepared_h, aad,
+                                          args->aad_bytes);
+    }
+    state = ghash_update_prepared_vec(state, prepared_h, ciphertext,
+                                      args->bytes);
+    uint8_t length_block[16];
+    store_be64(length_block, args->aad_bytes * 8U);
+    store_be64(length_block + 8, args->bytes * 8U);
+    const uint8x16_t product = gf128_mul_prepared_vec(
+        veorq_u8(state, vld1q_u8(length_block)), prepared_h);
+    vst1q_u8(tag, veorq_u8(product, vld1q_u8(tag_mask)));
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Verified release using an exact, already-computed AES-CTR keystream.  This
+// is intentionally not a bare XOR operator: the final mask is derived from
+// the same GHASH/tag verification that authenticates the ciphertext, so a
+// speculative buffer can never turn an invalid ciphertext into visible KV.
+__global__ __aicpu__ uint32_t secure_infer_gcm_verify_xor(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeGcmVerifyXorArgs*>(opaque);
+    const auto* ciphertext = reinterpret_cast<const uint8_t*>(args->ciphertext);
+    const auto* key = reinterpret_cast<const uint8_t*>(args->key);
+    const auto* h = reinterpret_cast<const uint8_t*>(args->hash_subkey);
+    const auto* expected = reinterpret_cast<const uint8_t*>(args->expected_tag);
+    const auto* aad = reinterpret_cast<const uint8_t*>(args->aad);
+    const auto* keystream = reinterpret_cast<const uint8_t*>(args->keystream);
+    auto* plaintext = reinterpret_cast<uint8_t*>(args->plaintext_output);
+    auto* status = reinterpret_cast<uint32_t*>(args->status_output);
+    if (ciphertext == nullptr || key == nullptr || h == nullptr ||
+        expected == nullptr || keystream == nullptr || plaintext == nullptr ||
+        status == nullptr || args->bytes == 0 ||
+        (args->aad_bytes != 0 && aad == nullptr) ||
+        args->aad_bytes > UINT64_MAX / 8U) {
+        return 2;
+    }
+
+    uint8_t expanded[176];
+    aes128_expand_key(key, expanded);
+    uint8_t j0[16];
+    make_counter_block(j0, args->iv_words, 1U);
+    uint8_t tag_mask[16];
+    vst1q_u8(tag_mask, aes128_encrypt_block(vld1q_u8(j0), expanded));
+
+    const GhashPreparedKey prepared_h = ghash_prepare_key(h);
+    uint8x16_t state = vdupq_n_u8(0);
+    if (args->aad_bytes != 0) {
+        state = ghash_update_prepared_vec(state, prepared_h, aad,
+                                          args->aad_bytes);
+    }
+    state = ghash_update_prepared_vec(state, prepared_h, ciphertext,
+                                      args->bytes);
+    uint8_t length_block[16];
+    store_be64(length_block, args->aad_bytes * 8U);
+    store_be64(length_block + 8, args->bytes * 8U);
+    uint8_t product[16];
+    vst1q_u8(product, gf128_mul_prepared_vec(
+        veorq_u8(state, vld1q_u8(length_block)), prepared_h));
+
+    uint8_t difference = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+        difference |= static_cast<uint8_t>((product[i] ^ tag_mask[i]) ^
+                                            expected[i]);
+    }
+    const uint32_t authenticated = difference == 0 ? 1U : 0U;
+    const uint8_t mask = static_cast<uint8_t>(0U - authenticated);
+    uint64_t offset = 0;
+    const uint64_t full_bytes = args->bytes & ~static_cast<uint64_t>(15);
+    const uint8x16_t vector_mask = vdupq_n_u8(mask);
+    while (offset < full_bytes) {
+        const uint8x16_t decrypted = vandq_u8(
+            veorq_u8(vld1q_u8(ciphertext + offset),
+                     vld1q_u8(keystream + offset)),
+            vector_mask);
+        vst1q_u8(plaintext + offset, decrypted);
+        offset += 16;
+    }
+    while (offset < args->bytes) {
+        plaintext[offset] = static_cast<uint8_t>(
+            (ciphertext[offset] ^ keystream[offset]) & mask);
+        ++offset;
+    }
+    *status = authenticated;
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Authentication-only form used by the heterogeneous verified-release
+// pipeline.  It deliberately performs the exact same GCM tag computation as
+// secure_infer_gcm_verify_xor, but does not serialize a payload XOR behind GHASH.
+// The serving path joins this status with a separately produced plaintext and
+// records the layer-consumption event only after the fail-closed gate.
+__global__ __aicpu__ uint32_t secure_infer_gcm_verify_only(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeGcmVerifyArgs*>(opaque);
+    const auto* ciphertext = reinterpret_cast<const uint8_t*>(args->ciphertext);
+    const auto* key = reinterpret_cast<const uint8_t*>(args->key);
+    const auto* h = reinterpret_cast<const uint8_t*>(args->hash_subkey);
+    const auto* expected = reinterpret_cast<const uint8_t*>(args->expected_tag);
+    const auto* aad = reinterpret_cast<const uint8_t*>(args->aad);
+    auto* status = reinterpret_cast<uint32_t*>(args->status_output);
+    if (ciphertext == nullptr || key == nullptr || h == nullptr ||
+        expected == nullptr || status == nullptr || args->bytes == 0 ||
+        (args->aad_bytes != 0 && aad == nullptr) ||
+        args->aad_bytes > UINT64_MAX / 8U) {
+        return 2;
+    }
+
+    uint8_t expanded[176];
+    aes128_expand_key(key, expanded);
+    uint8_t j0[16];
+    make_counter_block(j0, args->iv_words, 1U);
+    uint8_t tag_mask[16];
+    vst1q_u8(tag_mask, aes128_encrypt_block(vld1q_u8(j0), expanded));
+
+    const GhashPreparedKey prepared_h = ghash_prepare_key(h);
+    uint8x16_t state = vdupq_n_u8(0);
+    if (args->aad_bytes != 0) {
+        state = ghash_update_prepared_vec(state, prepared_h, aad,
+                                          args->aad_bytes);
+    }
+    state = ghash_update_prepared_vec(state, prepared_h, ciphertext,
+                                      args->bytes);
+    uint8_t length_block[16];
+    store_be64(length_block, args->aad_bytes * 8U);
+    store_be64(length_block + 8, args->bytes * 8U);
+    uint8_t product[16];
+    vst1q_u8(product, gf128_mul_prepared_vec(
+        veorq_u8(state, vld1q_u8(length_block)), prepared_h));
+
+    uint8_t difference = 0;
+    for (uint32_t i = 0; i < 16; ++i) {
+        difference |= static_cast<uint8_t>((product[i] ^ tag_mask[i]) ^
+                                            expected[i]);
+    }
+    *status = difference == 0 ? 1U : 0U;
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Process a small set of *independent* GCM records in one AICPU launch.  The
+// records are intentionally not concatenated: GCM authenticates each
+// ciphertext under its own nonce/tag, and each destination is written only
+// after that record's comparison succeeds.  Computing all GHASH values before
+// any release also preserves verify-before-use for every record.
+__global__ __aicpu__ uint32_t secure_infer_gcm_verify_xor_batch(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeGcmVerifyXorBatchArgs*>(opaque);
+    const auto* key = reinterpret_cast<const uint8_t*>(args->key);
+    const auto* h = reinterpret_cast<const uint8_t*>(args->hash_subkey);
+    if (key == nullptr || h == nullptr || args->bytes == 0 ||
+        args->count == 0 || args->count > PIPE_GCM_VERIFY_XOR_BATCH_MAX) {
+        return 2;
+    }
+
+    const uint8_t* ciphertexts[PIPE_GCM_VERIFY_XOR_BATCH_MAX] = {};
+    const uint8_t* expected_tags[PIPE_GCM_VERIFY_XOR_BATCH_MAX] = {};
+    const uint8_t* keystreams[PIPE_GCM_VERIFY_XOR_BATCH_MAX] = {};
+    uint8_t* plaintexts[PIPE_GCM_VERIFY_XOR_BATCH_MAX] = {};
+    uint32_t* statuses[PIPE_GCM_VERIFY_XOR_BATCH_MAX] = {};
+    const uint8_t* aads[PIPE_GCM_VERIFY_XOR_BATCH_MAX] = {};
+    uint8x16_t states[PIPE_GCM_VERIFY_XOR_BATCH_MAX];
+    uint8_t tag_masks[PIPE_GCM_VERIFY_XOR_BATCH_MAX][16] = {};
+    for (uint32_t index = 0; index < args->count; ++index) {
+        ciphertexts[index] = reinterpret_cast<const uint8_t*>(args->ciphertexts[index]);
+        expected_tags[index] = reinterpret_cast<const uint8_t*>(args->expected_tags[index]);
+        keystreams[index] = reinterpret_cast<const uint8_t*>(args->keystreams[index]);
+        plaintexts[index] = reinterpret_cast<uint8_t*>(args->plaintext_outputs[index]);
+        statuses[index] = reinterpret_cast<uint32_t*>(args->status_outputs[index]);
+        aads[index] = reinterpret_cast<const uint8_t*>(args->aad[index]);
+        if (ciphertexts[index] == nullptr || expected_tags[index] == nullptr ||
+            keystreams[index] == nullptr || plaintexts[index] == nullptr ||
+            statuses[index] == nullptr ||
+            (args->aad_bytes != 0 && aads[index] == nullptr)) {
+            return 3;
+        }
+        states[index] = vdupq_n_u8(0);
+    }
+
+    uint8_t expanded[176];
+    aes128_expand_key(key, expanded);
+    for (uint32_t index = 0; index < args->count; ++index) {
+        uint8_t j0[16];
+        make_counter_block(j0, args->iv_words[index], 1U);
+        vst1q_u8(tag_masks[index],
+                  aes128_encrypt_block(vld1q_u8(j0), expanded));
+    }
+
+    // In all serving paths slices are 32-byte aligned.  Keep arbitrary-size
+    // correctness by delegating the rare tail case to the scalar record path.
+    // The full-block loop exposes independent states to the PMULL scheduler.
+    const GhashPreparedKey prepared_h = ghash_prepare_key(h);
+    if (args->aad_bytes != 0) {
+        for (uint32_t index = 0; index < args->count; ++index) {
+            states[index] = ghash_update_prepared_vec(
+                states[index], prepared_h, aads[index], args->aad_bytes);
+        }
+    }
+    const uint64_t full_bytes = args->bytes & ~static_cast<uint64_t>(15);
+    uint64_t offset = 0;
+    for (; offset < full_bytes; offset += 16) {
+        for (uint32_t index = 0; index < args->count; ++index) {
+            states[index] = gf128_mul_prepared_vec(
+                veorq_u8(states[index], vld1q_u8(ciphertexts[index] + offset)),
+                prepared_h);
+        }
+    }
+    if (offset < args->bytes) {
+        for (uint32_t index = 0; index < args->count; ++index) {
+            uint8_t tail[16] = {};
+            for (uint64_t byte = 0; byte < args->bytes - offset; ++byte) {
+                tail[byte] = ciphertexts[index][offset + byte];
+            }
+            states[index] = gf128_mul_prepared_vec(
+                veorq_u8(states[index], vld1q_u8(tail)), prepared_h);
+        }
+    }
+
+    uint8_t length_block[16];
+    store_be64(length_block, args->aad_bytes * 8U);
+    store_be64(length_block + 8, args->bytes * 8U);
+    uint8_t masks[PIPE_GCM_VERIFY_XOR_BATCH_MAX] = {};
+    for (uint32_t index = 0; index < args->count; ++index) {
+        uint8_t product[16];
+        vst1q_u8(product, gf128_mul_prepared_vec(
+            veorq_u8(states[index], vld1q_u8(length_block)), prepared_h));
+        uint8_t difference = 0;
+        for (uint32_t byte = 0; byte < 16; ++byte) {
+            difference |= static_cast<uint8_t>((product[byte] ^ tag_masks[index][byte]) ^
+                                                expected_tags[index][byte]);
+        }
+        const uint32_t authenticated = difference == 0 ? 1U : 0U;
+        masks[index] = static_cast<uint8_t>(0U - authenticated);
+        *statuses[index] = authenticated;
+    }
+    for (uint32_t index = 0; index < args->count; ++index) {
+        const uint8x16_t vector_mask = vdupq_n_u8(masks[index]);
+        uint64_t byte = 0;
+        for (; byte < full_bytes; byte += 16) {
+            vst1q_u8(plaintexts[index] + byte, vandq_u8(
+                veorq_u8(vld1q_u8(ciphertexts[index] + byte),
+                         vld1q_u8(keystreams[index] + byte)), vector_mask));
+        }
+        for (; byte < args->bytes; ++byte) {
+            plaintexts[index][byte] = static_cast<uint8_t>(
+                (ciphertexts[index][byte] ^ keystreams[index][byte]) & masks[index]);
+        }
+    }
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Diagnostic twin of secure_infer_gcm_verify_xor.  It measures the online shell
+// that remains after removing ciphertext-dependent authentication: one AICPU
+// task still reads ciphertext and the exact ticket keystream, performs the
+// vector XOR, writes plaintext, and publishes the status consumed by the same
+// downstream D2D release.  It intentionally provides no authenticity and is
+// reachable only through SecureInfer's precise-profile-only control.
+__global__ __aicpu__ uint32_t secure_infer_gcm_xor_only(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeGcmVerifyXorArgs*>(opaque);
+    const auto* ciphertext = reinterpret_cast<const uint8_t*>(args->ciphertext);
+    const auto* keystream = reinterpret_cast<const uint8_t*>(args->keystream);
+    auto* plaintext = reinterpret_cast<uint8_t*>(args->plaintext_output);
+    auto* status = reinterpret_cast<uint32_t*>(args->status_output);
+    if (ciphertext == nullptr || keystream == nullptr || plaintext == nullptr ||
+        status == nullptr || args->bytes == 0) {
+        return 2;
+    }
+
+    uint64_t offset = 0;
+    const uint64_t full_bytes = args->bytes & ~static_cast<uint64_t>(15);
+    while (offset < full_bytes) {
+        vst1q_u8(plaintext + offset,
+                 veorq_u8(vld1q_u8(ciphertext + offset),
+                          vld1q_u8(keystream + offset)));
+        offset += 16;
+    }
+    while (offset < args->bytes) {
+        plaintext[offset] = ciphertext[offset] ^ keystream[offset];
+        ++offset;
+    }
+    *status = 1U;
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+__global__ __aicpu__ uint32_t secure_infer_ghash(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeGhashArgs*>(opaque);
+    const auto* input = reinterpret_cast<const uint8_t*>(args->input);
+    const auto* h = reinterpret_cast<const uint8_t*>(args->hash_subkey);
+    auto* output = reinterpret_cast<uint8_t*>(args->output);
+    const auto* aad = reinterpret_cast<const uint8_t*>(args->aad);
+    if (input == nullptr || h == nullptr || output == nullptr) return 2;
+
+    const GhashPreparedKey prepared_h = ghash_prepare_key(h);
+    uint8x16_t state = vdupq_n_u8(0);
+    const uint32_t iterations = args->iterations == 0 ? 1 : args->iterations;
+    for (uint32_t iteration = 0; iteration < iterations; ++iteration) {
+        state = vdupq_n_u8(0);
+        if (args->aad_bytes != 0) {
+            if (aad == nullptr) return 3;
+            state = ghash_update_prepared_vec(state, prepared_h, aad,
+                                              args->aad_bytes);
+        }
+        state = ghash_update_prepared_vec(state, prepared_h, input,
+                                          args->input_bytes);
+        uint8_t length_block[16];
+        store_be64(length_block, args->aad_bytes * 8U);
+        store_be64(length_block + 8, args->input_bytes * 8U);
+        state = gf128_mul_prepared_vec(
+            veorq_u8(state, vld1q_u8(length_block)), prepared_h);
+    }
+    uint8_t final_tag[16];
+    const auto* tag_mask = reinterpret_cast<const uint8_t*>(args->tag_mask);
+    vst1q_u8(final_tag, state);
+    for (uint32_t i = 0; i < 16; ++i) {
+        if ((args->flags & PIPE_GHASH_FINALIZE_TAG) != 0) {
+            if (tag_mask == nullptr) return 4;
+            final_tag[i] ^= tag_mask[i];
+        }
+        output[i] = final_tag[i];
+    }
+
+    uint32_t authenticated = 1;
+    if ((args->flags & PIPE_GHASH_VERIFY_TAG) != 0) {
+        const auto* expected =
+            reinterpret_cast<const uint8_t*>(args->expected_tag);
+        if (expected == nullptr) return 5;
+        uint8_t difference = 0;
+        for (uint32_t i = 0; i < 16; ++i) {
+            difference |= static_cast<uint8_t>(final_tag[i] ^ expected[i]);
+        }
+        authenticated = difference == 0 ? 1U : 0U;
+    }
+
+    if ((args->flags & PIPE_GHASH_XOR_ON_SUCCESS) != 0) {
+        const auto* keystream =
+            reinterpret_cast<const uint8_t*>(args->keystream);
+        auto* plaintext = reinterpret_cast<uint8_t*>(args->plaintext_output);
+        if (keystream == nullptr || plaintext == nullptr) return 6;
+        const uint8_t mask = static_cast<uint8_t>(0U - authenticated);
+        for (uint64_t i = 0; i < args->input_bytes; ++i) {
+            plaintext[i] = static_cast<uint8_t>(
+                (input[i] ^ keystream[i]) & mask);
+        }
+    }
+    if (args->status_output != 0) {
+        auto* status = reinterpret_cast<uint32_t*>(args->status_output);
+        *status = authenticated;
+    }
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Gate the output of a fallback AES kernel with the authentication result.
+// This lets a stream execute GHASH verify -> full AES-CTR -> auth gate without
+// a Host synchronization. Invalid ciphertext can never become model-visible.
+__global__ __aicpu__ uint32_t secure_infer_auth_gate(void *opaque)
+{
+    if (opaque == nullptr) return 1;
+    const auto* args = static_cast<const PipeAuthGateArgs*>(opaque);
+    auto* data = reinterpret_cast<uint8_t*>(args->data);
+    const auto* status = reinterpret_cast<const uint32_t*>(args->status);
+    if (data == nullptr || status == nullptr) return 2;
+    // The overwhelmingly common authenticated path needs only a status load
+    // and a barrier.  Scanning the complete KV slice on success erased the
+    // benefit of computing GHASH and XOR concurrently.  On failure, clear
+    // the speculative destination before the layer-ready event can be
+    // recorded, preserving fail-closed verify-before-use semantics.
+    if (*status != 1U) {
+        for (uint64_t i = 0; i < args->bytes; ++i) data[i] = 0;
+    }
+    AscendC::DataStoreBarrier();
+    return 0;
+}

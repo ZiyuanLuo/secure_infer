@@ -1,0 +1,10 @@
+.git
+.env
+runs
+model
+models
+.cache
+__pycache__
+*.so
+*.o
+*.d
