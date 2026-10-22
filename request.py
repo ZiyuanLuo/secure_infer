@@ -1,10 +1,12 @@
 """构造共享前缀和不同后缀，并测量一次主机 KV 重载。"""
 import argparse
 import json
+import math
 import os
 import time
 import urllib.request
 import urllib.parse
+import uuid
 from pathlib import Path
 
 
@@ -32,6 +34,9 @@ def main():
     if min(a.output_tokens, a.repeat) < 1:
         p.error("输出长度和重复次数必须大于零")
 
+    if not math.isfinite(a.store_wait) or a.store_wait < 0:
+        p.error("写回等待时间必须是非负有限数")
+
     # 本机服务不经过宿主机或容器继承的 HTTP 代理。
     local = urllib.parse.urlsplit(a.url).hostname in {"localhost", "127.0.0.1", "::1"}
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({})) if local else urllib.request.build_opener()
@@ -53,23 +58,20 @@ def main():
         return (pattern * ((length + len(pattern) - 1) // len(pattern)))[:length]
 
     prefix = fit(tokens(" Shared reference context."), a.prefix_tokens)
-    warm_pattern = tokens(" Warmup context.")
-    target_pattern = tokens(" New question.")
-    if warm_pattern[0] == target_pattern[0]:
-        target_pattern = [next(x for x in target_pattern if x != warm_pattern[0])] + target_pattern
     # The warmup request creates the host-resident prefix entry.  The suffix
     # is intentionally absent here, matching the reload experiment: the
     # target request supplies a new uncached suffix after the device cache is
     # cleared.
     payload = {"model": a.model, "prompt": prefix,
                "max_tokens": 1, "temperature": 0, "ignore_eos": True}
-    with post("/v1/completions", payload) as r:
-        warmed = json.load(r)
-    if "error" in warmed:
-        raise RuntimeError(warmed["error"])
-    if a.store_wait < 0:
-        raise RuntimeError("写回等待时间不能为负数")
-    if not a.no_device_reset:
+    if prefix:
+        with post("/v1/completions", payload) as r:
+            warmed = json.load(r)
+        if "error" in warmed:
+            raise RuntimeError(warmed["error"])
+        if warmed.get("usage", {}).get("prompt_tokens") != a.prefix_tokens:
+            raise RuntimeError("预热请求的实际前缀长度不匹配")
+    if prefix and not a.no_device_reset:
         # Keep the external/host cache and clear only the device-side prefix
         # cache.  This is the operation that makes the following request use
         # the secure H2D reload path instead of a GPU prefix hit.
@@ -82,6 +84,8 @@ def main():
 
     rows = []
     for index in range(a.repeat):
+        # Give each target a different suffix before starting the timer.
+        target_pattern = tokens(uuid.uuid4().hex + " New question.")
         if not a.no_device_reset:
             # Reset before every target so repeated measurements do not reuse
             # the target's device KV blocks from the previous iteration.

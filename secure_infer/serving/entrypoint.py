@@ -33,6 +33,8 @@ def main() -> int:
         raise SystemExit("SERVE_MODE must be runtime or plain")
     cmd.extend(sys.argv[1:])
     env = os.environ.copy()
+    # Enable the native cache-reset endpoint used by request.py.
+    env.setdefault("VLLM_SERVER_DEV_MODE", "1")
     env["PYTHONPATH"] = str(root) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     return subprocess.call(cmd, env=env)
 

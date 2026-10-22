@@ -85,7 +85,7 @@ curl http://127.0.0.1:8080/v1/models
 
 ## 构造前缀和后缀
 
-请求脚本调用服务端 tokenizer，用 token ID 数组精确构造输入。每次先发送“共享前缀 + 预热后缀”，再测“共享前缀 + 新后缀”。非空后缀从首个 token 开始不同，输出通过 ignore_eos 固定 token 数。
+请求脚本调用服务端 tokenizer，用 token ID 数组精确构造输入。每次先发送只有共享前缀的请求，等待异步 D2H 写回，再调用 `/reset_prefix_cache?reset_external=false` 清空设备缓存并保留主机缓存，最后测量“共享前缀 + 后缀”。输出通过 ignore_eos 固定 token 数。服务入口默认设置 `VLLM_SERVER_DEV_MODE=1` 以启用此实验接口。
 
 ~~~bash
 ./manage.sh query --prefix-tokens 512 --suffix-tokens 512 --output-tokens 16
@@ -106,7 +106,7 @@ PREFIX_TOKENS 和 SUFFIX_TOKENS 仅设置请求脚本默认值；控制器按真
 
 输出包含实际输入和输出 token 数、TTFT、TPOT、端到端总时延和响应文本。TTFT 从发起 HTTP 请求到首个非空文本块，TPOT 根据首末文本块时间和服务端输出 token 数计算，总时延计到流式完成标记。流式块可能合并 token，因此为客户端观测口径。
 
---repeat 2 连续测量两次，第二次可能命中完整 GPU 缓存。共享前缀预热可测 GPU 缓存；主机 KV 重载需要先完成主机写回，再驱逐设备缓存并保留主机条目，结合传输日志确认加载和决策。
+`--store-wait 8` 设置写回等待秒数。每次重复前都会清空设备缓存。`--no-device-reset` 可用于设备缓存命中测试。HTTP 200 不代表设备缓存一定清空成功：异步任务尚未释放块时，vLLM 可能拒绝清空。测量时需结合服务日志中的成功清空记录、实际 host-cache match 和 H2D 加载记录确认路径。脚本为每次目标请求生成不同的后缀，避免重复命中已写回的后缀 KV；仍需按实际缓存命中长度核对。
 
 ## 明文对照
 
