@@ -416,6 +416,9 @@ class SecureInferOffloadingConnectorScheduler(OffloadingConnectorScheduler):
 
     def __init__(self, spec):
         super().__init__(spec)
+        # Older vLLM offloading schedulers do not track this optional set.
+        if not hasattr(self, "_blocks_being_loaded"):
+            self._blocks_being_loaded = None
         self._secure_ready_expected_workers = max(
             1, int(spec.vllm_config.parallel_config.world_size)
         )

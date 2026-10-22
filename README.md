@@ -85,7 +85,7 @@ curl http://127.0.0.1:8080/v1/models
 
 ## 构造前缀和后缀
 
-请求脚本调用服务端 tokenizer，用 token ID 数组精确构造输入。每次先发送只有共享前缀的请求，等待异步 D2H 写回，再调用 `/reset_prefix_cache?reset_external=false` 清空设备缓存并保留主机缓存，最后测量“共享前缀 + 后缀”。输出通过 ignore_eos 固定 token 数。服务入口默认设置 `VLLM_SERVER_DEV_MODE=1` 以启用此实验接口。
+请求脚本调用服务端 tokenizer，用 token ID 数组精确构造输入。每次先发送只有共享前缀的请求，等待异步 D2H 写回，再调用 `/reset_prefix_cache?reset_external=false` 清空设备缓存并保留主机缓存，清空前发送两个不足一个 KV 块的短请求，让调度器处理前序请求的完成通知。最后测量“共享前缀 + 后缀”。输出通过 ignore_eos 固定 token 数。服务入口默认设置 `VLLM_SERVER_DEV_MODE=1` 以启用此实验接口。
 
 ~~~bash
 ./manage.sh query --prefix-tokens 512 --suffix-tokens 512 --output-tokens 16

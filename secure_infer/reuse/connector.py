@@ -37,7 +37,8 @@ def publish_progress(req_id, state):
         claim_ns=state.get('claim_ns'),last_service_ms=state.get('last_service_ms'),
         last_load_tokens=state.get('last_load_tokens'),layers=state['layers'],
         layer_ready=state.get('layer_ready',0),ready_offsets=state.get('ready_offsets',[]))
-    path=progress_path(); temporary=path.with_suffix('.tmp')
+    path=progress_path(); temporary=path.with_name(
+        f'{path.name}.{os.getpid()}.{threading.get_ident()}.tmp')
     temporary.write_text(json.dumps(row)); os.replace(temporary,path)
 
 @dataclass
@@ -443,3 +444,20 @@ class RuntimeConnector(NativeLayerConnector):
         spec=OffloadingSpecFactory.create_spec(config,kv_cache_config)
         self.connector_scheduler=RuntimeStorageScheduler(spec) if role==KVConnectorRole.SCHEDULER else None
         self.connector_worker=RuntimeWorker(spec) if role==KVConnectorRole.WORKER else None
+
+
+    def get_kv_connector_stats(self):
+        from vllm.v1.outputs import KVConnectorOutput
+        if 'kv_connector_worker_meta' in KVConnectorOutput.__annotations__:
+            return super().get_kv_connector_stats()
+        from .legacy_metadata import RuntimeControlStats
+        metadata = self.build_connector_worker_meta()
+        return RuntimeControlStats({'metadata': metadata}) if metadata is not None else None
+
+    def update_connector_output(self, output):
+        from .legacy_metadata import RuntimeControlStats
+        stats = output.kv_connector_stats
+        if isinstance(stats, RuntimeControlStats):
+            output.kv_connector_worker_meta = stats.data.get('metadata')
+            output.kv_connector_stats = None
+        return super().update_connector_output(output)

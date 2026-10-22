@@ -78,6 +78,15 @@ def main():
         time.sleep(a.store_wait)
 
     def reset_device_prefix_cache():
+        # Advance scheduler steps so the previous request releases its blocks.
+        for _ in range(2):
+            probe = fit(tokens(uuid.uuid4().hex + " Cache release."), 1)
+            with post("/v1/completions", {"model": a.model, "prompt": probe,
+                      "max_tokens": 1, "temperature": 0, "ignore_eos": True}) as r:
+                result = json.load(r)
+            if "error" in result:
+                raise RuntimeError(result["error"])
+            time.sleep(1)
         with post("/reset_prefix_cache?reset_external=false", {}) as response:
             body = response.read().decode("utf-8", errors="replace")
         print(json.dumps({"device_prefix_cache_reset": body}, ensure_ascii=False), flush=True)
