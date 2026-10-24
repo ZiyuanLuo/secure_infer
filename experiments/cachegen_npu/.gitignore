@@ -1,0 +1,9 @@
+*.json
+*.log
+build*/
+results*/
+data/
+__pycache__/
+codec_build/
+crypto_build/
+*.so
