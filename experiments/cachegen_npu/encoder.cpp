@@ -4,6 +4,8 @@
 #include <cstring>
 #include "kernel/lz4/lz4.h"
 
+#include "kernel/bitshuffle_neon.h"
+
 // BF16 -> CacheGen per-token INT8 -> block bitshuffle -> LZ4.
 // Caller provides all storage. No hidden device work or allocator on this path.
 extern "C" int paci_encode_symbols(const uint16_t* input, uint32_t tokens,
@@ -25,13 +27,26 @@ extern "C" int paci_encode_symbols(const uint16_t* input, uint32_t tokens,
   if(!std::isfinite(max1)){invalid=1;continue;}
   float scale=max1/127.0f;scales[t]=scale;
   auto divisor=vdupq_n_f32(scale>0?scale:1.0f);
+  float inverse=1.0f/(scale>0?scale:1.0f);
+  auto inverse_vector=vdupq_n_f32(inverse);
   for(uint32_t c=0;c<channels;c+=8) {
    uint16x8_t bits=vld1q_u16(src+c);
    auto lo=vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(bits),16));
    auto hi=vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(bits),16));
-   auto qlo=vaddq_s32(vcvtnq_s32_f32(vdivq_f32(lo,divisor)),vdupq_n_s32(127));
-   auto qhi=vaddq_s32(vcvtnq_s32_f32(vdivq_f32(hi,divisor)),vdupq_n_s32(127));
+   auto scaled_lo=vmulq_f32(lo,inverse_vector);
+   auto scaled_hi=vmulq_f32(hi,inverse_vector);
+   // A reciprocal avoids one division per vector. Close to a rounding
+   // boundary, use division to retain the exact reference INT8 symbols.
+   // 1e-4 exceeds float32 reciprocal/product error over [-127,127].
+   auto distance=vmaxq_f32(vabsq_f32(vsubq_f32(scaled_lo,vrndnq_f32(scaled_lo))),
+                           vabsq_f32(vsubq_f32(scaled_hi,vrndnq_f32(scaled_hi))));
+   if(!std::isfinite(inverse)||vmaxvq_f32(distance)>=0.4999f) {
+    scaled_lo=vdivq_f32(lo,divisor);scaled_hi=vdivq_f32(hi,divisor);
+   }
+   auto qlo=vaddq_s32(vcvtnq_s32_f32(scaled_lo),vdupq_n_s32(127));
+   auto qhi=vaddq_s32(vcvtnq_s32_f32(scaled_hi),vdupq_n_s32(127));
    uint8x8_t q=vqmovn_u16(vcombine_u16(vqmovun_s32(qlo),vqmovun_s32(qhi)));
+   q=vmin_u8(q,vdup_n_u8(254));
    vst1_u8(ids+uint64_t(t)*channels+c,q);
   }
  }
@@ -39,13 +54,8 @@ extern "C" int paci_encode_symbols(const uint16_t* input, uint32_t tokens,
  uint64_t n=uint64_t(tokens)*channels;
  #pragma omp parallel for num_threads(threads)
  for(uint64_t base=0;base<n;base+=128) {
-  for(uint32_t group=0;group<16;++group) {
-   uint64_t word;std::memcpy(&word,ids+base+group*8,8);
-   uint64_t tmp=(word^(word>>7))&0x00AA00AA00AA00AAULL;word^=tmp^(tmp<<7);
-   tmp=(word^(word>>14))&0x0000CCCC0000CCCCULL;word^=tmp^(tmp<<14);
-   tmp=(word^(word>>28))&0x00000000F0F0F0F0ULL;word^=tmp^(tmp<<28);
-   for(uint32_t bit=0;bit<8;++bit)shuffled[base+bit*16+group]=uint8_t(word>>(8*bit));
-  }
+  shuffle64(ids+base,shuffled+base);
+  shuffle64(ids+base+64,shuffled+base+8);
  }
  return LZ4_compress_default(reinterpret_cast<const char*>(shuffled),encoded,n,capacity);
 }

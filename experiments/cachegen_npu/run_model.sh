@@ -15,4 +15,5 @@ g++ -O3 -std=c++17 -march=armv8-a+simd -fopenmp -shared -fPIC \
   encoder.cpp -l:liblz4.so.1 -o libhost_encoder.so
 g++ -std=c++17 -shared -fPIC -O2 driver.cpp   -I"$CODEC_CANN_ROOT/include" -L"$CODEC_CANN_ROOT/lib64"   -Lcrypto_build -Lcodec_build -Wl,-rpath,'$ORIGIN'   -Wl,-rpath,'$ORIGIN/../crypto_build' -lopapi -lnnopbase -lascendcl   -lruntime_aicpu_ghash -lcachegen_entropy_restore -o codec_build/libentropy_driver.so
 python3 test_encoder.py
+python3 test_encoder_precision.py
 exec python3 model_bench.py "$@"

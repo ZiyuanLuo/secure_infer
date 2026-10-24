@@ -58,26 +58,37 @@ nonce_counter=0
 def prepare_cache(cpu_cache,mode):
  global nonce_counter
  started=time.perf_counter(); layers=[]; raw_bytes=wire=0
+ encode_ms=seal_ms=allocate_ms=0.
  for index,(k,v) in enumerate(cpu_cache):
   output=[]; streams=[torch.npu.Stream() for _ in range(4)]
+  status_count=2*((len(k)+args.chunk-1)//args.chunk)
+  statuses=torch.ones(status_count,dtype=torch.int32,device='npu')
+  record_index=0
   for kind,values in enumerate((k,v)):
    nt,heads,dim=values.shape; channels=heads*dim
    destination=torch.empty((nt,heads,dim),dtype=torch.bfloat16,device='npu')
+   # Reuse host workspaces across records; their contents are copied into
+   # immutable payload bytes before the next encode call.
+   if mode=='bslz4_fast':
+    scale_work=np.empty(args.chunk,dtype=np.float32)
+    ids_work=np.empty(args.chunk*channels,dtype=np.uint8)
+    shuffled_work=np.empty_like(ids_work)
+    encoded_work=C.create_string_buffer(ids_work.size*2)
    for start in range(0,nt,args.chunk):
+    encode_started=time.perf_counter()
     count=min(args.chunk,nt-start)
     raw=values[start:start+count].contiguous().view(torch.int16).numpy().view(np.uint16)
-    x=(raw.astype(np.uint32)<<16).view(np.float32).reshape(count,channels)
     flag=0
     if mode=='bslz4_fast':
      if native_encoder is None:raise RuntimeError('libhost_encoder.so is required')
-     scales=np.empty(count,dtype=np.float32);ids=np.empty(count*channels,dtype=np.uint8);shuffled=np.empty_like(ids)
-     encoded=C.create_string_buffer(ids.size*2)
-     size=native_encoder.paci_encode_symbols(raw.ctypes.data,count,channels,scales.ctypes.data,ids.ctypes.data,shuffled.ctypes.data,encoded,len(encoded),4)
+     scales=scale_work[:count]
+     size=native_encoder.paci_encode_symbols(raw.ctypes.data,count,channels,scales.ctypes.data,ids_work.ctypes.data,shuffled_work.ctypes.data,encoded_work,len(encoded_work),4)
      if size<=0:raise RuntimeError(('native encoder',size))
-     payload=scales.astype('<f4').tobytes()+encoded.raw[:size];flag=0x60000000|size
+     payload=scales.astype('<f4',copy=False).tobytes()+C.string_at(encoded_work,size);flag=0x60000000|size
     elif mode in ('plain','bf16','bf16_serial'):
      payload=raw.astype('<u2').tobytes()
     else:
+     x=(raw.astype(np.uint32)<<16).view(np.float32).reshape(count,channels)
      scale=np.max(np.abs(x),axis=-1,keepdims=True)/127
      ids=np.clip(np.rint(x/np.where(scale>0,scale,1))+127,0,254).astype(np.uint8)
      if mode=='bslz4':
@@ -92,9 +103,13 @@ def prepare_cache(cpu_cache,mode):
       data=encoded.raw[:size];flag=0x40000000|size
       if mode=='bslz4':flag|=0x20000000
      payload=scale.astype('<f4').tobytes()+data
+    encode_ms+=(time.perf_counter()-encode_started)*1000
     nonce_counter+=1;nonce=nonce_counter.to_bytes(12,'big')
     aad=struct.pack('<8Q',index,kind,start,count,channels,len(payload),flag,1)
+    seal_started=time.perf_counter()
     sealed=payload if mode=='plain' else AESGCM(key).encrypt(nonce,payload,aad)
+    seal_ms+=(time.perf_counter()-seal_started)*1000
+    allocate_started=time.perf_counter()
     wire_blob=sealed if mode=='plain' else sealed+aad
     host=torch.from_numpy(np.frombuffer(wire_blob,np.uint8).copy()).pin_memory()
     wire_device=torch.empty(host.numel(),dtype=torch.uint8,device='npu')
@@ -108,20 +123,24 @@ def prepare_cache(cpu_cache,mode):
      aad_device=wire_device[len(payload)+16:len(payload)+80]
     record=dict(host=host,wire_device=wire_device,cipher=cipher,plain=plaintext,
       tag=tag,aad=aad_device,
-      status=torch.ones(1,dtype=torch.int32,device='npu'),
+      status=statuses[record_index:record_index+1],
       scratch=torch.empty(count*channels,dtype=torch.uint8,device='npu'),
       target=destination[start:start+count],count=count,channels=channels,flag=flag,
       iv=struct.unpack('>4I',nonce+struct.pack('>I',2)),stream=streams[len(output)%4])
+    record_index+=1
     output.append(record);raw_bytes+=raw.nbytes
     wire+=len(sealed)+64+12+8
+    allocate_ms+=(time.perf_counter()-allocate_started)*1000
    output.append(destination)
   # Strip destination sentinels from records and retain K/V outputs.
   destinations=[item for item in output if isinstance(item,torch.Tensor)]
   records=[item for item in output if isinstance(item,dict)]
   layers.append(dict(records=records,outputs=destinations,event=torch.npu.Event()))
- torch.npu.synchronize()
+ sync_started=time.perf_counter();torch.npu.synchronize()
  return layers,dict(encode_and_stage_ms=(time.perf_counter()-started)*1000,raw_bytes=raw_bytes,
-                    wire_bytes=wire,ratio=raw_bytes/wire)
+                    wire_bytes=wire,ratio=raw_bytes/wire,
+                    host_encode_ms=encode_ms,host_seal_ms=seal_ms,
+                    record_allocation_ms=allocate_ms,prepare_sync_ms=(time.perf_counter()-sync_started)*1000)
 
 class Loader:
  def __init__(self,layers,mode):

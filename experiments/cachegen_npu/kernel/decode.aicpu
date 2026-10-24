@@ -1,6 +1,7 @@
 #include "aicpu_api.h"
 #include "codec.h"
 #include <arm_neon.h>
+#include "bitshuffle_neon.h"
 #include "miniz/miniz_tinfl.c"
 #include <string.h>
 #define LZ4_FREESTANDING 1
@@ -8,6 +9,18 @@
 #define LZ4_memmove memmove
 #define LZ4_memset memset
 #include "lz4/lz4.c"
+
+static inline void restore8(uint8x8_t codes, float32x4_t scale, uint16_t* out) {
+ uint16x8_t values=vmovl_u8(codes);
+ int32x4_t low=vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(values))),vdupq_n_s32(127));
+ int32x4_t high=vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(values))),vdupq_n_s32(127));
+ uint32x4_t lo=vreinterpretq_u32_f32(vmulq_f32(vcvtq_f32_s32(low),scale));
+ uint32x4_t hi=vreinterpretq_u32_f32(vmulq_f32(vcvtq_f32_s32(high),scale));
+ // Round to nearest even when restoring BF16, including subnormals.
+ lo=vaddq_u32(lo,vaddq_u32(vdupq_n_u32(0x7fff),vandq_u32(vshrq_n_u32(lo,16),vdupq_n_u32(1))));
+ hi=vaddq_u32(hi,vaddq_u32(vdupq_n_u32(0x7fff),vandq_u32(vshrq_n_u32(hi,16),vdupq_n_u32(1))));
+ vst1q_u16(out,vcombine_u16(vshrn_n_u32(lo,16),vshrn_n_u32(hi,16)));
+}
 
 // Entropy restoration and BF16 reconstruction share one AICPU launch.
 __global__ __aicpu__ uint32_t entropy_restore(void* opaque) {
@@ -34,32 +47,28 @@ __global__ __aicpu__ uint32_t entropy_restore(void* opaque) {
        a->compressed_bytes, TINFL_FLAG_PARSE_ZLIB_HEADER);
  }
  if (length != expected) { *status = 2; return 3; }
+ if ((a->compressed_bytes & 0x20000000U) && a->channels%128) {
+   *status=2;return 4;
+ }
  for (uint32_t t=0; t<a->tokens; ++t) {
    const float32x4_t scale = vdupq_n_f32(scales[t]);
-   for (uint32_t c=0; c<a->channels; c+=8) {
+   if (a->compressed_bytes & 0x20000000U) {
+    for(uint32_t c=0;c<a->channels;c+=128) {
+     uint64_t base=uint64_t(t)*a->channels+c;
+     for(int half=0;half<2;++half) {
+      uint8x16_t codes[4];unshuffle64(symbols+base+8*half,codes);
+      for(int group=0;group<4;++group) {
+       uint16_t* dst=out+base+64*half+16*group;
+       restore8(vget_low_u8(codes[group]),scale,dst);
+       restore8(vget_high_u8(codes[group]),scale,dst+8);
+      }
+     }
+    }
+   } else {
+    for(uint32_t c=0;c<a->channels;c+=8) {
      uint64_t i=uint64_t(t)*a->channels+c;
-     uint8x8_t codes;
-     if (a->compressed_bytes & 0x20000000U) {
-       // Undo a 128-symbol bit transpose and fuse reconstruction into this pass.
-       uint64_t base=(i/128)*128, group=(i%128)/8, word=0;
-       for (uint32_t bit=0;bit<8;++bit) word|=uint64_t(symbols[base+bit*16+group])<<(8*bit);
-       uint64_t tmp=(word^(word>>7))&0x00AA00AA00AA00AAULL;
-       word^=tmp^(tmp<<7);
-       tmp=(word^(word>>14))&0x0000CCCC0000CCCCULL;
-       word^=tmp^(tmp<<14);
-       tmp=(word^(word>>28))&0x00000000F0F0F0F0ULL;
-       word^=tmp^(tmp<<28);
-       codes=vld1_u8(reinterpret_cast<const uint8_t*>(&word));
-     } else codes=vld1_u8(symbols+i);
-     uint16x8_t values=vmovl_u8(codes);
-     int32x4_t low=vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(values))),vdupq_n_s32(127));
-     int32x4_t high=vsubq_s32(vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(values))),vdupq_n_s32(127));
-     uint32x4_t lo=vreinterpretq_u32_f32(vmulq_f32(vcvtq_f32_s32(low),scale));
-     uint32x4_t hi=vreinterpretq_u32_f32(vmulq_f32(vcvtq_f32_s32(high),scale));
-     // Round to nearest even when restoring BF16, including subnormals.
-     lo=vaddq_u32(lo,vaddq_u32(vdupq_n_u32(0x7fff),vandq_u32(vshrq_n_u32(lo,16),vdupq_n_u32(1))));
-     hi=vaddq_u32(hi,vaddq_u32(vdupq_n_u32(0x7fff),vandq_u32(vshrq_n_u32(hi,16),vdupq_n_u32(1))));
-     vst1q_u16(out+i,vcombine_u16(vshrn_n_u32(lo,16),vshrn_n_u32(hi,16)));
+     restore8(vld1_u8(symbols+i),scale,out+i);
+    }
    }
  }
  return 0;
