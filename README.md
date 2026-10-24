@@ -64,6 +64,8 @@ curl http://127.0.0.1:8080/v1/models
 |---|---|
 | MODEL_PATH / MODEL_NAME | 模型目录和 API 模型名称 |
 | DEVICE_IDS / TP_SIZE | 可见 NPU 编号与张量并行度 |
+| PP_SIZE | 流水线并行度，默认 1 |
+| DISTRIBUTED_EXECUTOR_BACKEND | 分布式执行后端，默认 mp；本项目多机部署使用 ray |
 | HOST / PORT | 服务监听地址和端口 |
 | MAX_MODEL_LEN | 输入加输出 token 总长度上限 |
 | MAX_NUM_BATCHED_TOKENS | 单步 token 预算 |
@@ -82,6 +84,12 @@ curl http://127.0.0.1:8080/v1/models
 | RESULT_DIR | 结果目录，默认 runs/current |
 
 .env、权重、日志和编译产物不提交到版本库。部署路径只写入本地 .env。可选设备库放入项目目录后可配置为项目相对路径。
+
+## 多机 PP 部署
+
+服务入口支持 `PP_SIZE`、`TP_SIZE` 和 `DISTRIBUTED_EXECUTOR_BACKEND`。PP=2、TP=8 对应两台八卡服务器共同运行一个模型，每台负责一段模型层，节点内八卡做张量并行。
+
+[多机启动步骤](deploy/pp4_tp8/README.md)包含 Ray 节点启动、模型挂载和服务入口。已用 DeepSeek-R1-Distill-Llama-70B 的真实 BF16 权重验证两机16卡原生明文 PP 推理。该部署路径使用 `SERVE_MODE=plain`；PACI 的 connector、认证和 controller 的 PP 配合不属于本次验证范围。
 
 ## 构造前缀和后缀
 

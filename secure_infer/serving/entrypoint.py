@@ -16,6 +16,8 @@ def main() -> int:
         "--port", os.environ.get("PORT", "8080"),
         "--served-model-name", os.environ.get("MODEL_NAME", "runtime-model"),
         "--tensor-parallel-size", os.environ.get("TP_SIZE", "1"),
+        "--pipeline-parallel-size", os.environ.get("PP_SIZE", "1"),
+        "--distributed-executor-backend", os.environ.get("DISTRIBUTED_EXECUTOR_BACKEND", "mp"),
         "--max-num-seqs", os.environ.get("MAX_NUM_SEQS", "1"),
         "--max-model-len", os.environ.get("MAX_MODEL_LEN", "8192"),
         "--max-num-batched-tokens", os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"),
