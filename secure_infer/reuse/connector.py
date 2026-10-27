@@ -157,7 +157,7 @@ class RuntimeScheduler(Scheduler):
                             now_ns=time.monotonic_ns(),step_ms=compute,step_tokens=delta,
                             layers=observed['layers'],suffix_ms_override=entry_gate.compute_ms(
                                 model,request.num_prompt_tokens-state['R'],state['R']),
-                            next_compute_ms_override=compute,error_margin_ms=model['residual_ms'],
+                            next_compute_ms_override=compute,
                             queued_compute_ms=max(0.,entry_gate.head_ms(model,request.num_computed_tokens,CHUNK)-
                                 (time.monotonic_ns()-state['started_ns'])/1e6))
                         early=decision['stop']
@@ -385,7 +385,6 @@ class RuntimeWorker(NativeWorker):
                 compute_end=control['end'],stop=control['stop'],done=False,error=None,loaded_blocks=0,
                 dynamic_target=control['dynamic_target'],layers=len(self.names),
                 layer_ready=0,
-                diagnostic_drain=('-cakesync-' in req_id or '-halfsync-' in req_id),
                 submitted=[kick['R'] for _ in self.names],verified=[kick['R'] for _ in self.names],
                 events=deque(),submissions_done=False,ready_offsets=[0.0 for _ in self.names])
             self.cake_jobs[req_id]=state
@@ -419,10 +418,6 @@ class RuntimeWorker(NativeWorker):
             assert not state['error'],state['error']
             assert state['ready']<=boundary,(state['ready'],boundary)
             trace('consumption_wait_end',request_id=req_id,**self.snapshot(state))
-            if state['diagnostic_drain']:
-                trace('diagnostic_device_drain_begin',request_id=req_id)
-                torch.npu.synchronize()
-                trace('diagnostic_device_drain_end',request_id=req_id)
             self.cake_consuming=None
 
     def take_secure_store_metadata(self):

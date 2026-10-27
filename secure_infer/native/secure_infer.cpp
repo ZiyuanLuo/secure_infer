@@ -27,12 +27,10 @@
 #include <unistd.h>
 #include <openssl/rand.h>
 std::mutex g_ctx_map_mutex;
-static bool enable_encrypt = false;
 static bool enable_h2d_encrypt = false;
 static bool enable_d2h_encrypt = false;
-static bool enable_decrypt = false;
-extern size_t encrypt_magic_sz = 0xabcde;
-extern size_t decrypt_magic_sz = 0xabcde;
+size_t encrypt_magic_sz = 0xabcde;
+size_t decrypt_magic_sz = 0xabcde;
 std::map<EVP_CIPHER_CTX *, std::shared_ptr<encrypt_metadata>> m_ctx_metadata;
 std::map<size_t, EVP_CIPHER_CTX *> m_magic_encctx;
 std::set<size_t> s_magic;
@@ -78,7 +76,6 @@ using LaunchInlineAESKernel_t = void (*)(uint32_t, void*, uint8_t*, uint8_t*,
                                          uint32_t, uint32_t, uint32_t,
                                          uint32_t);
 static LaunchInlineAESKernel_t g_launch_inline_iv_kernel = nullptr;
-static void* g_aes_lib_handle = nullptr;
 // This is the independently verified AIV mode-1 entry.  It takes a device
 // IV pointer rather than packed inline scalars; do not substitute the older
 // inline-IV implementation for GCM keystream generation.
@@ -1900,15 +1897,7 @@ void profile_count_d2h_kv(size_t bytes)
     profile_count_d2h_kv_batch(bytes, 1, nullptr);
 }
 
-// void __attribute__((destructor)) secure_infer_fini() {
-//     fprintf(stderr, "[SecureInfer] 🛑 正在停止 Worker 线程...\n");
-//     g_running = false;
-//     // 稍微等一下让线程有机会退出
-//     usleep(200000);
-//     fprintf(stderr, "[SecureInfer] 👋 SecureInfer 退出完成\n");
-// }
 
-// [修改加载函数，加载新NPU算子]
 static void load_aes_library() {
     if (g_launch_kernel && g_launch_inline_iv_kernel) return;
 
@@ -2299,7 +2288,7 @@ struct d2h_host_decrypt_group {
     aclrtStream ready_stream = nullptr;
     size_t expected_tasks = 0;
     size_t staging_bytes = 0;
-    size_t payload_caruntimety = 0;
+    size_t payload_capacity = 0;
     unsigned char* host_tags = nullptr;
     unsigned char* host_tag_masks = nullptr;
     void* dev_ghash_h = nullptr;
@@ -2346,6 +2335,8 @@ static std::mutex g_d2h_cpu_queue_lock;
 static std::condition_variable g_d2h_cpu_queue_cv;
 static std::deque<d2h_host_decrypt_group*> g_d2h_cpu_queue;
 static std::once_flag g_d2h_cpu_workers_once;
+static std::vector<std::thread> g_d2h_cpu_workers;
+static bool g_d2h_cpu_stopping = false;
 
 static bool capture_d2h_profile_run(char* run_id, size_t run_id_size)
 {
@@ -2497,7 +2488,10 @@ static void d2h_cpu_worker_loop()
         d2h_host_decrypt_group* group = nullptr;
         {
             std::unique_lock<std::mutex> lock(g_d2h_cpu_queue_lock);
-            g_d2h_cpu_queue_cv.wait(lock, [] { return !g_d2h_cpu_queue.empty(); });
+            g_d2h_cpu_queue_cv.wait(lock, [] {
+                return g_d2h_cpu_stopping || !g_d2h_cpu_queue.empty();
+            });
+            if (g_d2h_cpu_queue.empty()) break;
             group = g_d2h_cpu_queue.front();
             g_d2h_cpu_queue.pop_front();
         }
@@ -2510,15 +2504,29 @@ static void d2h_cpu_worker_loop()
         batch->completed_groups.fetch_add(1, std::memory_order_release);
         batch->completion_cv.notify_all();
     }
+    real_EVP_CIPHER_CTX_free(host_ctx);
+}
+
+static void stop_d2h_cpu_workers()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_d2h_cpu_queue_lock);
+        g_d2h_cpu_stopping = true;
+    }
+    g_d2h_cpu_queue_cv.notify_all();
+    for (auto& worker : g_d2h_cpu_workers) worker.join();
 }
 
 static void ensure_d2h_cpu_workers_started()
 {
     std::call_once(g_d2h_cpu_workers_once, [] {
         const size_t workers = d2h_cpu_worker_count();
+        g_d2h_cpu_workers.reserve(workers);
         for (size_t i = 0; i < workers; ++i) {
-            std::thread(d2h_cpu_worker_loop).detach();
+            g_d2h_cpu_workers.emplace_back(d2h_cpu_worker_loop);
         }
+        // Join waiters before the global condition variable is destroyed.
+        std::atexit(stop_d2h_cpu_workers);
         fprintf(stderr,
                 "[SecureInfer] secure D2H CPU decrypt workers: %zu\n",
                 workers);
@@ -2755,7 +2763,7 @@ HOOK_C_API HOOK_DECL_EXPORT int secure_infer_d2h_group_end()
             ret = real_aclrtMemcpyAsync(
                 group->host_tags, tag_bytes,
                 static_cast<uint8_t*>(slot->temp_out) +
-                    group->payload_caruntimety + group->expected_tasks * 16,
+                    group->payload_capacity + group->expected_tasks * 16,
                 tag_bytes, ACL_MEMCPY_DEVICE_TO_HOST,
                 pipeline->copy_stream);
             if (ret != ACL_SUCCESS) return static_cast<int>(ret);
@@ -2919,7 +2927,7 @@ static uint32_t calc_aes_block_dim(size_t bytes) {
 
 static bool ensure_h2d_device_crypto(encrypt_metadata& meta, aclrtStream stream)
 {
-    if (!g_launch_inline_iv_kernel) load_aes_library();
+    if (!secure_infer_gcm_enabled() && !g_launch_inline_iv_kernel) load_aes_library();
     if (meta.dev_key == nullptr || meta.dev_iv == nullptr) {
         if (real_aclrtMalloc(&meta.dev_key, 32) != ACL_SUCCESS) return false;
         // The AscendC kernel performs one aligned 32-byte GM load for IV.
@@ -2936,8 +2944,8 @@ static bool ensure_h2d_device_crypto(encrypt_metadata& meta, aclrtStream stream)
     }
     g_dev_key = meta.dev_key;
     g_dev_iv = meta.dev_iv;
-    if (g_launch_inline_iv_kernel == nullptr || g_dev_key == nullptr ||
-        stream == nullptr) {
+    if ((!secure_infer_gcm_enabled() && g_launch_inline_iv_kernel == nullptr) ||
+        g_dev_key == nullptr || stream == nullptr) {
         return false;
     }
 
@@ -3210,6 +3218,8 @@ static std::deque<std::shared_ptr<gcm_cpu_cipher_record>>
     g_gcm_cpu_cipher_queue;
 static size_t g_gcm_cpu_cipher_reserved_bytes = 0;
 static std::once_flag g_gcm_cpu_cipher_workers_once;
+static std::vector<std::thread> g_gcm_cpu_cipher_workers;
+static bool g_gcm_cpu_cipher_stopping = false;
 static std::atomic<uint64_t> g_gcm_cpu_cipher_zero_copy_handoffs{0};
 
 static unsigned char* alloc_gcm_cpu_cipher_buffer(size_t bytes, bool* pinned)
@@ -3289,9 +3299,11 @@ static void gcm_cpu_cipher_worker_loop()
             std::unique_lock<std::mutex> lock(g_gcm_cpu_cipher_lock);
             g_gcm_cpu_cipher_cv.wait_for(lock, std::chrono::milliseconds(1), [] {
                 return !g_gcm_cpu_cipher_queue.empty() ||
+                    g_gcm_cpu_cipher_stopping ||
                     !g_running.load(std::memory_order_acquire);
             });
-            if (!g_running.load(std::memory_order_acquire)) break;
+            if (g_gcm_cpu_cipher_stopping ||
+                !g_running.load(std::memory_order_acquire)) break;
             if (g_gcm_cpu_cipher_queue.empty()) continue;
             record = std::move(g_gcm_cpu_cipher_queue.front());
             g_gcm_cpu_cipher_queue.pop_front();
@@ -3376,14 +3388,25 @@ static void gcm_cpu_cipher_worker_loop()
     real_EVP_CIPHER_CTX_free(ctx);
 }
 
+static void stop_gcm_cpu_cipher_workers()
+{
+    {
+        std::lock_guard<std::mutex> lock(g_gcm_cpu_cipher_lock);
+        g_gcm_cpu_cipher_stopping = true;
+    }
+    g_gcm_cpu_cipher_cv.notify_all();
+    for (auto& worker : g_gcm_cpu_cipher_workers) worker.join();
+}
+
 static void ensure_gcm_cpu_cipher_workers()
 {
     std::call_once(g_gcm_cpu_cipher_workers_once, [] {
         const int workers = gcm_cpu_cipher_worker_count();
+        g_gcm_cpu_cipher_workers.reserve(workers);
         for (int index = 0; index < workers; ++index) {
-            auto* worker = new std::thread(gcm_cpu_cipher_worker_loop);
-            worker->detach();
+            g_gcm_cpu_cipher_workers.emplace_back(gcm_cpu_cipher_worker_loop);
         }
+        std::atexit(stop_gcm_cpu_cipher_workers);
         fprintf(stderr,
                 "[SecureInfer] GCM CPU ciphertext pool: workers=%d, "
                 "records=%zu, bytes=%.1f MiB\n",
@@ -3790,7 +3813,7 @@ void secure_infer_gcm_keystream_prewarm(aclrtStream stream)
     // Prewarming must obey the same byte budget as the reusable buffer
     // cache.  Count-only clamping allowed 4096 x 1.25-MiB allocations during
     // model startup even with a 1-GiB cache budget, stealing HBM from vLLM's
-    // KV cache before its caruntimety probe.  The cache cannot retain more than
+    // KV cache before its capacity probe.  The cache cannot retain more than
     // this number anyway, so allocating the excess has no warmup value.
     const size_t byte_budget = gcm_keystream_cache_byte_limit();
     const size_t budget_count = std::max<size_t>(1, byte_budget / bytes);
@@ -4171,7 +4194,7 @@ static bool gcm_ticket_is_near_active_h2d(uint64_t ticket)
     return ticket - current <= gcm_dynamic_aicpu_reserve_tickets();
 }
 
-// The AIV AES kernel is useful caruntimety, but it is not a replacement for the
+// The AIV AES kernel is useful capacity, but it is not a replacement for the
 // whole AICPU producer under a fast KV restore.  Admit only the share it can
 // sustainably finish before the consumer catches up.  The conservative
 // default (60 MB/s * 0.8) is intentionally far below the standalone AIV rate:
@@ -5104,12 +5127,10 @@ struct h2d_gcm_pipeline_slot {
     std::shared_future<int> authentication_observed;
 };
 
-// Recovery experiments observe every verifier result, not injector metadata.
-// The worker waits on a real completion event; there is no layer-count timer.
-static bool recovery_event_monitor_enabled()
+// Layer readiness depends on the actual verifier result, independently of logs.
+static bool authentication_observer_enabled()
 {
-    const char* path = std::getenv("PIPE_GCM_FAULT_EVENT_PATH");
-    return path != nullptr && *path != '\0';
+    return secure_infer_h2d_gcm_enabled();
 }
 
 struct recovery_auth_record {
@@ -5120,7 +5141,7 @@ struct recovery_auth_record {
     uint32_t tensor = UINT32_MAX;
     size_t bytes = 0;
     uint64_t job_id = 0;
-    size_t destination_caruntimety = 0;
+    size_t destination_capacity = 0;
     void* destination = nullptr;
     const void* source = nullptr;
     aclrtStream stream = nullptr;
@@ -5138,6 +5159,54 @@ static std::map<uint32_t, std::vector<std::shared_ptr<recovery_auth_record>>>
     g_recovery_layer_records;
 static thread_local uint64_t g_recovery_job_id = 0;
 
+// The observer returns resources only after the status-copy event completes.
+// Reusing them avoids pinning memory and creating an event for every KV record.
+struct auth_observation_resource {
+    uint32_t* status = nullptr;
+    aclrtEvent event = nullptr;
+};
+static std::mutex g_auth_resource_lock;
+static std::unordered_map<void*, std::vector<auth_observation_resource>>
+    g_auth_resources;
+
+static bool acquire_auth_resource(aclrtContext context,
+                                  uint32_t** status, aclrtEvent* event)
+{
+    {
+        std::lock_guard<std::mutex> guard(g_auth_resource_lock);
+        auto& resources = g_auth_resources[context];
+        if (!resources.empty()) {
+            const auto resource = resources.back();
+            resources.pop_back();
+            *status = resource.status;
+            *event = resource.event;
+            return true;
+        }
+    }
+    if (real_aclrtMallocHost(reinterpret_cast<void**>(status),
+                            sizeof(uint32_t)) != ACL_SUCCESS) return false;
+    if (real_aclrtCreateEvent(event) == ACL_SUCCESS) return true;
+    real_aclrtFreeHost(*status);
+    *status = nullptr;
+    return false;
+}
+
+static void release_auth_resource(aclrtContext context,
+                                  uint32_t* status, aclrtEvent event,
+                                  bool completed)
+{
+    if (completed) {
+        std::lock_guard<std::mutex> guard(g_auth_resource_lock);
+        auto& resources = g_auth_resources[context];
+        if (resources.size() < 128) {
+            resources.push_back({status, event});
+            return;
+        }
+    }
+    real_aclrtDestroyEvent(event);
+    real_aclrtFreeHost(status);
+}
+
 extern "C" void secure_infer_recovery_set_job_id(uint64_t job_id)
 {
     g_recovery_job_id = job_id;
@@ -5145,7 +5214,7 @@ extern "C" void secure_infer_recovery_set_job_id(uint64_t job_id)
 
 static std::shared_ptr<recovery_auth_record> observe_recovery_authentication(
     void* device_status, aclrtStream verifier_stream, uint32_t layer,
-    uint32_t tensor, void* destination, size_t destination_caruntimety,
+    uint32_t tensor, void* destination, size_t destination_capacity,
     const void* source, size_t bytes, aclrtStream transfer_stream)
 {
     auto record = std::make_shared<recovery_auth_record>();
@@ -5154,13 +5223,12 @@ static std::shared_ptr<recovery_auth_record> observe_recovery_authentication(
     record->bytes = bytes;
     record->job_id = g_recovery_job_id;
     record->destination = destination;
-    record->destination_caruntimety = destination_caruntimety;
+    record->destination_capacity = destination_capacity;
     record->source = source;
     record->stream = transfer_stream;
     if (aclrtGetCurrentContext(&record->context) != ACL_SUCCESS ||
-        real_aclrtMallocHost(reinterpret_cast<void**>(&record->host_status),
-                            sizeof(uint32_t)) != ACL_SUCCESS ||
-        real_aclrtCreateEvent(&record->ready) != ACL_SUCCESS ||
+        !acquire_auth_resource(record->context,
+                               &record->host_status, &record->ready) ||
         real_aclrtMemcpyAsync(record->host_status, sizeof(uint32_t),
                              device_status, sizeof(uint32_t),
                              ACL_MEMCPY_DEVICE_TO_HOST, verifier_stream) != ACL_SUCCESS ||
@@ -5200,8 +5268,9 @@ static std::shared_ptr<recovery_auth_record> observe_recovery_authentication(
                     }
                     secure_infer_record_h2d_fault_event("authentication_record_observed",
                         item->layer, item->tensor, item->bytes);
-                    real_aclrtDestroyEvent(item->ready);
-                    real_aclrtFreeHost(item->host_status);
+                    release_auth_resource(item->context,
+                                          item->host_status, item->ready,
+                                          ret == ACL_SUCCESS);
                     item->result.set_value(status);
                 }
             }).detach();
@@ -5538,7 +5607,7 @@ static void retire_h2d_gcm_pipeline_slot(h2d_gcm_pipeline_slot& slot)
         if (slot.authentication_observed.get() < 0) std::abort();
         slot.authentication_observed = {};
     }
-    if (!recovery_event_monitor_enabled() &&
+    if (!authentication_observer_enabled() &&
         slot.profile_tamper_injected && slot.profile_auth_status != nullptr &&
         gcm_fasttrack_eager_enabled()) {
         uint32_t auth_status_host = UINT32_MAX;
@@ -6133,10 +6202,9 @@ static aclError inline_h2d_encrypt_commit(void* dst,
 
     if (m_ctx_metadata.empty()) {
         fprintf(stderr,
-                "[SecureInfer] ⚠️ %s: 缺少加密元数据，回退 plaintext H2D: src=%p, size=%zu\n",
+                "[SecureInfer ERROR] %s: missing encryption context for registered KV %p/%zu\n",
                 reason, src, count);
-        return real_aclrtMemcpyAsync(dst, destMax, src, count,
-                                     ACL_MEMCPY_HOST_TO_DEVICE, stream);
+        return ACL_ERROR_INVALID_PARAM;
     }
 
     auto& meta = *m_ctx_metadata.begin()->second;
@@ -6158,10 +6226,9 @@ static aclError inline_h2d_encrypt_commit(void* dst,
         std::lock_guard<std::mutex> init_lock(g_inline_h2d_lock);
         if (!ensure_h2d_device_crypto(meta, stream)) {
         fprintf(stderr,
-                "[SecureInfer] ⚠️ %s: NPU crypto kernel/key 未就绪，回退 plaintext H2D: src=%p, size=%zu\n",
+                "[SecureInfer ERROR] %s: crypto backend not ready for registered KV %p/%zu\n",
                 reason, src, count);
-        return real_aclrtMemcpyAsync(dst, destMax, src, count,
-                                     ACL_MEMCPY_HOST_TO_DEVICE, stream);
+        return ACL_ERROR_INVALID_PARAM;
         }
     }
 
@@ -6638,12 +6705,12 @@ static aclError inline_h2d_encrypt_commit(void* dst,
                     ? g_launch_aicpu_gcm_verify_only_aad(
                           verify_stream, h2d_temp_in,
                           g_dev_key, meta.dev_ghash_h, expected_tag, auth_status,
-                          aligned_bytes, iv_words[0], iv_words[1], iv_words[2],
+                          count, iv_words[0], iv_words[1], iv_words[2],
                           iv_words[3], h2d_aad_device, gcm_aad_length)
                     : g_launch_aicpu_gcm_verify_only(
                           verify_stream, h2d_temp_in,
                           g_dev_key, meta.dev_ghash_h, expected_tag, auth_status,
-                          aligned_bytes, iv_words[0], iv_words[1], iv_words[2],
+                          count, iv_words[0], iv_words[1], iv_words[2],
                           iv_words[3]))
                 : -1;
             const bool xor_ok = verify_ret == 0 &&
@@ -6724,12 +6791,12 @@ static aclError inline_h2d_encrypt_commit(void* dst,
                 ? g_launch_aicpu_gcm_verify_xor_aad(
                       stream, h2d_temp_in, g_dev_key, meta.dev_ghash_h,
                       expected_tag, ready_keystream, verified_output, auth_status,
-                      aligned_bytes, iv_words[0], iv_words[1], iv_words[2],
+                      count, iv_words[0], iv_words[1], iv_words[2],
                       iv_words[3], h2d_aad_device, gcm_aad_length)
                 : g_launch_aicpu_gcm_verify_xor(
                       stream, h2d_temp_in, g_dev_key, meta.dev_ghash_h,
                       expected_tag, ready_keystream, verified_output, auth_status,
-                      aligned_bytes, iv_words[0], iv_words[1], iv_words[2],
+                      count, iv_words[0], iv_words[1], iv_words[2],
                       iv_words[3]);
             if (ret != 0) {
                 fprintf(stderr,
@@ -6748,12 +6815,12 @@ static aclError inline_h2d_encrypt_commit(void* dst,
             const int ret = aad_enabled
                 ? g_launch_aicpu_gcm_decrypt_verify_aad(
                       stream, h2d_temp_in, g_dev_key, meta.dev_ghash_h,
-                      expected_tag, verified_output, auth_status, aligned_bytes,
+                      expected_tag, verified_output, auth_status, count,
                       iv_words[0], iv_words[1], iv_words[2], iv_words[3],
                       h2d_aad_device, gcm_aad_length)
                 : g_launch_aicpu_gcm_decrypt_verify(
                       stream, h2d_temp_in, g_dev_key, meta.dev_ghash_h,
-                      expected_tag, verified_output, auth_status, aligned_bytes,
+                      expected_tag, verified_output, auth_status, count,
                       iv_words[0], iv_words[1], iv_words[2], iv_words[3]);
             if (ret != 0) {
                 fprintf(stderr,
@@ -6862,7 +6929,7 @@ static aclError inline_h2d_encrypt_commit(void* dst,
     // The tamper test must observe the specific corrupted slice even if
     // ordinary validation samples have already been consumed during warmup.
     run_gcm_validation = run_gcm_validation || tamper_injected;
-    if (recovery_event_monitor_enabled()) {
+    if (authentication_observer_enabled()) {
         // Generic event-driven handling replaces injector-selected validation.
         run_gcm_validation = false;
         if (gcm_auth_status == nullptr || gcm_pipeline_slot == nullptr) {
@@ -7131,8 +7198,8 @@ static aclError inline_h2d_encrypt_commit(void* dst,
 
 extern "C" int secure_infer_recovery_wait_layer_authentication(uint32_t layer)
 {
-    if (!recovery_event_monitor_enabled() || gcm_fasttrack_eager_enabled()) return 0;
-    for (;;) {
+    if (!authentication_observer_enabled() || gcm_fasttrack_eager_enabled()) return 0;
+    for (unsigned retry_round = 0;; ++retry_round) {
         std::vector<std::shared_ptr<recovery_auth_record>> records;
         {
             std::lock_guard<std::mutex> guard(g_recovery_auth_lock);
@@ -7144,14 +7211,14 @@ extern "C" int secure_infer_recovery_wait_layer_authentication(uint32_t layer)
         for (const auto& record : records) {
             const int status = record->observed.get();
             if (status == 1) continue;
-            if (status != 0) return -1;
+            if (status != 0 || retry_round != 0) return -1;
             secure_infer_record_h2d_fault_event("strict_retry_begin",
                 record->layer, record->tensor, record->bytes);
             // The failed record is identified exclusively by its verifier.
             // Issue a fresh ticket/IV from the trusted host copy.  The new
             // verifier result is checked on the next loop before layer use.
             if (inline_h2d_encrypt_commit(record->destination,
-                    record->destination_caruntimety, record->source, record->bytes,
+                    record->destination_capacity, record->source, record->bytes,
                     record->stream, "event-triggered authenticated H2D retry") != ACL_SUCCESS)
                 return -1;
             if (real_aclrtSynchronizeStream(record->stream) != ACL_SUCCESS) return -1;
@@ -7166,7 +7233,7 @@ extern "C" int secure_infer_recovery_wait_layer_authentication(uint32_t layer)
 // after submitting the complete H2D reload.
 extern "C" int secure_infer_recovery_wait_job_authentication(uint64_t job_id)
 {
-    if (!recovery_event_monitor_enabled() || !gcm_fasttrack_eager_enabled())
+    if (!authentication_observer_enabled() || !gcm_fasttrack_eager_enabled())
         return -1;
     std::vector<std::shared_ptr<recovery_auth_record>> records;
     {
@@ -7257,14 +7324,12 @@ static inline void init_encrypt_ctx(aclrtMemcpyKind kind, aclrtStream stream)
     std::call_once(init_once, [kind, stream] {
         (void)kind;
 
-        // 加载NPU算子库
-        load_aes_library();
+        // GCM uses the bundled AICPU kernels; CTR requires the legacy library.
+        if (!secure_infer_gcm_enabled()) load_aes_library();
 
         fprintf(stderr, "[SecureInfer Debug] ===== init_encrypt_ctx 开始 =====\n");
 
         // 读取环境变量
-        auto enable_encrypt_env = std::getenv("SECURE_INFER_ENABLE_ENCRYPT");
-        auto enable_decrypt_env = std::getenv("SECURE_INFER_ENABLE_DECRYPT");
 
         auto enable_h2d_env = std::getenv("PIPE_ENABLE_H2D");
         auto enable_d2h_env = std::getenv("PIPE_ENABLE_D2H");
@@ -7588,11 +7653,10 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
         serial_bypass != nullptr && std::atoi(serial_bypass) != 0;
     const bool plain_h2d = secure_infer_plain_h2d_enabled();
     const bool plain_d2h = secure_infer_plain_d2h_enabled();
-    if (count >= encrypt_threshold_sz &&
-        ((kind == ACL_MEMCPY_HOST_TO_DEVICE &&
+    if ((kind == ACL_MEMCPY_HOST_TO_DEVICE &&
           (serial_bypass_enabled || plain_h2d)) ||
          (kind == ACL_MEMCPY_DEVICE_TO_HOST &&
-          (serial_bypass_enabled || plain_d2h)))) {
+          (serial_bypass_enabled || plain_d2h))) {
         const bool measured_h2d =
             kind == ACL_MEMCPY_HOST_TO_DEVICE &&
             host_prediction_in_same_range(src, src, count);
@@ -7622,7 +7686,6 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
     // 4. 加密路径 (Host -> Device) —— 全量加密
     // =================================================================
     if (enable_h2d_encrypt && kind == ACL_MEMCPY_HOST_TO_DEVICE &&
-        count >= encrypt_threshold_sz &&
         host_prediction_in_same_range(src, src, count)) {
         static std::atomic<uint64_t> h2d_log_count{0};
         if (sampled_predict_log(h2d_log_count, 16, 4096)) {
@@ -7682,6 +7745,7 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
                                              "GCM ticketed H2D");
         }
 
+        aclError copy_status = ACL_SUCCESS;
         predictor.lock();
 
         if (periodic_address_predictor_enabled()) {
@@ -7834,31 +7898,6 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
             goto POST_PROCESS;
         }
 
-        // ==================== 情况 2: 重复循环模式（原有） ====================
-        // if (predictor.read_only_swap_profiled) {
-        //     auto &record = predictor.read_only_swap_record;
-        //     bool hit = src == record[predictor.read_only_swap_cur_idx].first &&
-        //                count == record[predictor.read_only_swap_cur_idx].second;
-
-        //     if (!hit) goto SERIAL_FALLBACK;
-
-        //     predictor.read_only_swap_cur_idx = (predictor.read_only_swap_cur_idx + 1) % record.size();
-        //     predictor.read_only_swap_pred_idx = (predictor.read_only_swap_pred_idx + 1) % record.size();
-
-        //     auto &entry = record[predictor.read_only_swap_pred_idx];
-        //     assign_to_workers(nullptr, entry.first, entry.second, false, true, false, false, false, stream);
-        //     assign_to_workers(dst, src, count, false, false, true, false, false, stream);
-        //     goto POST_PROCESS;
-        // }
-
-        // // ==================== 情况 3: 其他已知模式 ====================
-        // else if (predictor.other_swap_set.find(std::make_pair(src, count)) != predictor.other_swap_set.end()) {
-        //     predictor.other_swap_set.erase(std::make_pair(src, count));
-        //     assign_to_workers(nullptr, src, count, false, true, false, false, false, stream);
-        //     assign_to_workers(dst, src, count, false, false, true, false, false, stream);
-        //     goto POST_PROCESS;
-        // }
-
         // ==================== 情况 4: 模式发现阶段（新增线性检测） ====================
         else if (!predictor.read_only_swap_profiled && !predictor.linear_mode) {
             // fprintf(stderr, "[SecureInfer] 模式发现中 (size=%zu)\n", count);
@@ -7908,48 +7947,25 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
             // 先把未来块交给预测 worker，再走当前块的原地串行 fallback。
             // 这样 CPU 预测加密能和当前块 H2D/NPU pipeline 重叠；比盲目
             // 增大 window/worker 更克制，也更不容易重新触发 ACL backpressure。
-            inline_h2d_encrypt_commit(dst, destMax, src, count, stream,
-                                      "线性学习阶段 miss");
+            copy_status = inline_h2d_encrypt_commit(dst, destMax, src, count,
+                                                    stream, "线性学习阶段 miss");
 
-            // --- 原有重复模式检测 ---
-            // bool found = true;
-            // const int repeat = 32;
-            // auto size = record.size();
-            // if (size < repeat * 2 || (size % 2 == 1)) found = false;
-            // else {
-            //     auto mid = size / 2;
-            //     for (int i = 0; i < size / 2; i++) {
-            //         if (record[i] != record[mid + i]) { found = false; break; }
-            //     }
-            // }
-
-            // if (found) {
-            //     fprintf(stderr, "[SecureInfer] 发现重复模式! 开启预测优化\n");
-            //     for (int i = 0; i < size / 2; i++) record.pop_back();
-            //     predictor.read_only_swap_profiled = true;
-            //     predictor.read_only_swap_cur_idx = (size / 2) % record.size();
-            //     predictor.read_only_swap_pred_idx = (predictor.read_only_swap_cur_idx + 1) % record.size();
-
-            //     auto &entry1 = record[predictor.read_only_swap_pred_idx];
-            //     assign_to_workers(nullptr, entry1.first, entry1.second, false, true, false, false, false, stream);
-            // }
             goto POST_PROCESS;
         }
 
     SERIAL_FALLBACK:
-        inline_h2d_encrypt_commit(dst, destMax, src, count, stream,
-                                  "预测未命中 fallback");
+        copy_status = inline_h2d_encrypt_commit(dst, destMax, src, count,
+                                                stream, "预测未命中 fallback");
 
     POST_PROCESS:
         predictor.unlock();
-        return ACL_SUCCESS;
+        return copy_status;
     }
 
     // =================================================================
     // 5. 解密路径 (Device -> Host) - stream-ordered asynchronous host decrypt
     // =================================================================
     if (enable_d2h_encrypt && kind == ACL_MEMCPY_DEVICE_TO_HOST &&
-        count >= decrypt_threshold_sz &&
         host_prediction_in_same_range(dst, dst, count)) {
         std::lock_guard<std::mutex> d2h_lock(g_d2h_crypto_lock);
         const bool d2h_gcm_enabled = secure_infer_d2h_gcm_enabled();
@@ -8035,7 +8051,7 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
                         // slot but not the configured 2--3.  Reuse an already
                         // allocated slot after its copy_done event instead of
                         // failing the store (and crashing the framework after
-                        // a partial swap).  This is caruntimety-aware scheduling,
+                        // a partial swap).  This is capacity-aware scheduling,
                         // not utilization sampling: correctness and bounded
                         // memory take priority over overlap depth.
                         for (auto& fallback_slot : d2h_pipeline->slots) {
@@ -8059,7 +8075,7 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
                         return ACL_ERROR_INTERNAL_ERROR;
                     }
                     group->slot = d2h_slot;
-                    group->payload_caruntimety = reserve_tasks * count;
+                    group->payload_capacity = reserve_tasks * count;
                     group->ready_stream = d2h_pipeline->copy_stream;
                     auto& batch = *group->batch;
                     if (std::find(batch.streams.begin(), batch.streams.end(), stream)
@@ -8073,7 +8089,7 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
                     return ACL_ERROR_INTERNAL_ERROR;
                 }
                 d2h_slot = group->slot;
-                if (group->staging_bytes > group->payload_caruntimety - count) {
+                if (group->staging_bytes > group->payload_capacity - count) {
                     fprintf(stderr,
                             "[SecureInfer ERROR] D2H tensor group exceeded reserved staging\n");
                     return ACL_ERROR_INTERNAL_ERROR;
@@ -8135,14 +8151,14 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
                 const size_t tag_index = g_active_d2h_group->tasks.size();
                 d2h_device_tag_mask =
                     static_cast<uint8_t*>(d2h_slot->temp_out) +
-                    g_active_d2h_group->payload_caruntimety + tag_index * 16;
+                    g_active_d2h_group->payload_capacity + tag_index * 16;
                 d2h_device_tag =
                     static_cast<uint8_t*>(d2h_slot->temp_out) +
-                    g_active_d2h_group->payload_caruntimety +
+                    g_active_d2h_group->payload_capacity +
                     g_active_d2h_group->expected_tasks * 16 + tag_index * 16;
                 d2h_device_aad =
                     static_cast<uint8_t*>(d2h_slot->temp_out) +
-                    g_active_d2h_group->payload_caruntimety +
+                    g_active_d2h_group->payload_capacity +
                     g_active_d2h_group->expected_tasks * 32 +
                     tag_index * gcm_aad_length;
             } else {

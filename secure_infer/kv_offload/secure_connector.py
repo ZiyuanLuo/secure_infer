@@ -5,8 +5,8 @@ source.  A secure D2H store has two different completion semantics:
 
 * DEVICE_COPY_DONE: encrypted DMA no longer reads the source NPU KV blocks.
   vLLM may release those blocks.
-* SECURE_STORE_READY: host decryption (and, for a future GCM path,
-  authentication) has completed.  Only now may the CPU cache be published.
+* SECURE_STORE_READY: host decryption and authentication have completed.
+  Only now may the CPU cache be published.
 
 The stock connector collapses both states into ``finished_sending``.  This
 connector keeps ``finished_sending`` for device release and carries the later

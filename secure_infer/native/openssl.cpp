@@ -404,21 +404,17 @@ static void secure_infer_auto_handshake_on_load() {
     // 我们没有 Hook EVP_CIPHER_CTX_new/free，所以需要直接调用真实的
     // 由于 Makefile 中链接了 -lcrypto，这里可以直接调用，或者用 dlsym
     using fn_new = EVP_CIPHER_CTX* (*)(void);
-    using fn_free = void (*)(EVP_CIPHER_CTX*);
     using fn_algo = const EVP_CIPHER* (*)(void);
 
     auto real_ctx_new = (fn_new)dlsym(RTLD_NEXT, "EVP_CIPHER_CTX_new");
-    auto real_ctx_free = (fn_free)dlsym(RTLD_NEXT, "EVP_CIPHER_CTX_free");
     auto real_aes_gcm = (fn_algo)dlsym(RTLD_NEXT, "EVP_aes_128_ctr");
 
     if (!real_ctx_new || !real_aes_gcm) {
         // 如果找不到符号，说明 libcrypto 还没加载，尝试手动加载
         void* handle = dlopen("libcrypto.so.1.1", RTLD_LAZY | RTLD_GLOBAL);
-        if (!handle) handle = dlopen("libcrypto.so.1.1", RTLD_LAZY | RTLD_GLOBAL);
 
         if (handle) {
             real_ctx_new = (fn_new)dlsym(handle, "EVP_CIPHER_CTX_new");
-            real_ctx_free = (fn_free)dlsym(handle, "EVP_CIPHER_CTX_free");
             real_aes_gcm = (fn_algo)dlsym(handle, "EVP_aes_128_ctr");
         }
 

@@ -30,7 +30,7 @@ static std::atomic<uint64_t> g_ready_npu_keystream_commits{0};
 static std::atomic<uint64_t> g_busy_npu_keystream_fallbacks{0};
 static std::atomic<uint64_t> g_missing_npu_keystream_fallbacks{0};
 static std::atomic<uint64_t> g_submitted_npu_keystream_blocks{0};
-static std::atomic<uint64_t> g_caruntimety_npu_keystream_fallbacks{0};
+static std::atomic<uint64_t> g_capacity_npu_keystream_fallbacks{0};
 
 extern "C" __attribute__((visibility("default"))) void
 secure_infer_get_npu_keystream_stats(uint64_t* ready,
@@ -53,14 +53,14 @@ secure_infer_get_npu_keystream_stats(uint64_t* ready,
 
 extern "C" __attribute__((visibility("default"))) void
 secure_infer_get_npu_keystream_pool_stats(uint64_t* submitted_blocks,
-                                     uint64_t* caruntimety_fallbacks)
+                                     uint64_t* capacity_fallbacks)
 {
     if (submitted_blocks != nullptr) {
         *submitted_blocks = g_submitted_npu_keystream_blocks.load(
             std::memory_order_relaxed);
     }
-    if (caruntimety_fallbacks != nullptr) {
-        *caruntimety_fallbacks = g_caruntimety_npu_keystream_fallbacks.load(
+    if (capacity_fallbacks != nullptr) {
+        *capacity_fallbacks = g_capacity_npu_keystream_fallbacks.load(
             std::memory_order_relaxed);
     }
 }
@@ -254,7 +254,7 @@ static size_t keystream_producer_stream_count()
         }
         long parsed = env != nullptr ? std::atol(env) : 1;
         // A 20B model can expose MiB-scale real KV slices.  Sixteen streams
-        // still left most AICPU caruntimety idle on 910B3, so permit a wider
+        // still left most AICPU capacity idle on 910B3, so permit a wider
         // bounded pool for the real-request saturation sweep.  The serving
         // default remains one and experiments must opt in explicitly.
         parsed = std::max(1L, std::min(64L, parsed));
@@ -343,27 +343,6 @@ static bool gcm_scope_aware_admission_enabled()
     }
     return enabled != 0;
 }
-
-// 获取线程ID，区分是谁在打印
-static long get_tid() { return syscall(SYS_gettid); }
-static long long current_micros() {
-    auto now = std::chrono::system_clock::now();
-    auto duration = now.time_since_epoch();
-    return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-}
-
-static void busy_wait_us(long microseconds) {
-    auto start = std::chrono::high_resolution_clock::now();
-    while (true) {
-        auto now = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(now - start).count();
-        if (duration >= microseconds) {
-            break;
-        }
-        // 不调用 sleep/yield，死循环空转 CPU
-    }
-}
-#define LOG_PIPE(fmt, ...) fprintf(stderr, "[%lld][TID:%ld] " fmt "\n", current_micros(), get_tid(), ##__VA_ARGS__)
 
 static bool latency_worker_pinning_enabled()
 {
@@ -792,7 +771,7 @@ size_t process_garbage_collection(std::deque<GCBatch>& gc_queue) {
         auto local_id = x->local_id;
         char worker_name[16];
         std::snprintf(worker_name, sizeof(worker_name),
-                      "secure_infer-enc%d", local_id);
+                      "si-enc%d", local_id);
         pin_latency_worker(local_id + 1, worker_name);
 
         fprintf(stderr, "[encrypt_worker] worker_id=%d, local_id=%d, magic_sz=%zu\n",
@@ -1285,7 +1264,7 @@ size_t process_garbage_collection(std::deque<GCBatch>& gc_queue) {
              std::max<uint32_t>(task.ticket_batch_members, 1);
          if (reserved_npu_keystream_members() + members >
              max_npu_keystream_blocks()) {
-             g_caruntimety_npu_keystream_fallbacks.fetch_add(
+             g_capacity_npu_keystream_fallbacks.fetch_add(
                  members, std::memory_order_relaxed);
              return 0;
          }
@@ -1387,7 +1366,6 @@ size_t process_garbage_collection(std::deque<GCBatch>& gc_queue) {
 
     fprintf(stderr, "[Commit Worker] 🚀 启动成功 (Pipeline Mode)\n");
 
-    int ai_core_busy_count = 0;
 
     while (g_running.load()) {
 

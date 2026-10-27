@@ -684,7 +684,7 @@ def _log_npu_resource_stats() -> None:
         "submitted",
         "throttled",
         "deferred_pressure",
-        "deferred_caruntimety",
+        "deferred_capacity",
     )
     values = tuple(value.value for value in (*int_values, *count_values))
     if values == _SECURE_INFER_LAST_RESOURCE_STATS:
@@ -694,7 +694,7 @@ def _log_npu_resource_stats() -> None:
     logger.info(
         "SecureInfer NPU resource stats: cube=%d vector=%d aicpu=%d memory=%d "
         "pressure=%d submitted=%d throttled=%d deferred_pressure=%d "
-        "deferred_caruntimety=%d samples=%d errors=%d",
+        "deferred_capacity=%d samples=%d errors=%d",
         stats["cube_util"],
         stats["vector_util"],
         stats["aicpu_util"],
@@ -703,7 +703,7 @@ def _log_npu_resource_stats() -> None:
         stats["submitted"],
         stats["throttled"],
         stats["deferred_pressure"],
-        stats["deferred_caruntimety"],
+        stats["deferred_capacity"],
         stats["samples"],
         stats["sample_errors"],
     )

@@ -40,7 +40,7 @@ vi .env
 ./start.sh 模型目录
 ~~~
 
-脚本按需构建镜像，自动挂载项目、模型和驱动，编译 libsecure_infer.so，再后台启动。容器名由项目位置和账号生成；容器内使用 root 访问设备；停止时将生成文件的所有权归还调用账号。移动项目或更换账号无需改脚本。
+脚本按需构建镜像，自动挂载项目、模型和驱动，编译 libsecure_infer.so 和仓库自带的 AES-GCM AICPU 算子，再后台启动。容器名由项目位置和账号生成；容器内使用 root 访问设备；停止时将生成文件的所有权归还调用账号。移动项目或更换账号无需改脚本。
 
 ~~~bash
 ./manage.sh status
@@ -56,7 +56,7 @@ curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/v1/models
 ~~~
 
-已安装完整 Ascend 推理依赖时，可直接执行 ./configure.sh 和 ./run.sh。
+已安装完整 Ascend 推理依赖时，先加载本机 CANN、ATB 环境，再设置 ASCEND_ROOT 并执行 ./configure.sh 和 ./run.sh。
 
 ## 配置参数
 
@@ -76,7 +76,7 @@ curl http://127.0.0.1:8080/v1/models
 | PREFIX_TOKENS / SUFFIX_TOKENS | 请求脚本默认前后缀 token 数 |
 | SERVE_MODE | runtime 使用项目连接器；plain 使用原生 vLLM 且不预加载本地库 |
 | ENABLE_H2D / ENABLE_D2H | 本地库钩子开关；Python 连接器仍管理传输任务 |
-| GHASH_LIBRARY / AIV_KEYSTREAM_LIBRARY | 可选认证与密钥流库 |
+| GHASH_LIBRARY / AIV_KEYSTREAM_LIBRARY | 认证库默认使用项目内构建的 AICPU 库；可选 AIV 密钥流后端 |
 | ASCEND_ROOT | CANN 目录；为空时在容器中自动查找 |
 | PYTHON | 容器内的 Python 解释器 |
 | BASE_IMAGE / IMAGE | 基础镜像和构建镜像名称 |
@@ -130,11 +130,27 @@ PREFIX_TOKENS 和 SUFFIX_TOKENS 仅设置请求脚本默认值；控制器按真
 
 ## 实现与实验进度
 
-已有主机缓存匹配、逐层加载、在线估计、STOP/MORE 和异步写回代码。已完成 8 卡 70B 服务启动、短请求和三组 GPU 前缀缓存与明文的初步对照，每组一次。此前三组未进入完整主机 KV 重载路径，不能据此确定该路径的性能。
+runtime 启动入口默认使用 AES-GCM、预测性主机加密、设备密钥流预计算和异步 D2H 两阶段发布。每层通过认证和设备写入完成检查后才使用其 KV；注册的 KV 范围内，小于旧大小阈值的拷贝也经过密码路径。GCM 直接使用仓库自带的 AICPU 算子，不依赖旧的外部 AES-CTR 算子库。
 
-密钥供应与对端密钥协商集成尚未完成。进程内密码上下文注册完成不表示对端密钥协商完成。完整安全路径与流水化解压缩的端到端效果尚未由这轮实验验证。
+控制器增量读取已完成的设备观测；观测未改变时复用拟合结果，并批量计算候选切分点。STOP/MORE 保留在途计算和冲突写入等待，移除了旧误差阈值。异步加载、密钥流任务回收、D2H 发布依赖和多机 PP 启动接口均保留。
 
-## 本次整理验证
+密钥供应与对端密钥协商集成尚未完成。进程内密码上下文注册完成不表示对端密钥协商完成。本轮不涉及压缩路径。
+
+## 2026-10-27 代码整理验证
+
+- CPU 回归测试覆盖控制器、逐层交接、异步发布、写入冲突和多 rank 元数据；运行 `./run_test.sh`。
+- NPU 算子测试覆盖主机/设备 AES-GCM 互验、预计算密钥流及篡改拒绝：
+
+~~~bash
+python3 secure_infer/tests/crypto_smoke.py \
+  --library secure_infer/native/kernels/aicpu/build/libruntime_aicpu_ghash.so --devices 0
+~~~
+
+- `native_registered_transfer_smoke.py` 验证 16、31、4096、32768、262144 字节注册 KV 拷贝；需预加载本地库并设置独立的 `PIPE_GCM_FAULT_EVENT_PATH`。设置 `PIPE_ENABLE_D2H=1` 可同时验证异步写回。
+- `serving_smoke.py` 在独立服务上比较完整 prefill 与主机前缀复用的生成结果，使用不同 `cache_salt` 保证参考请求不复用缓存，并清空设备缓存后验证 H2D 重载。它会修改该测试服务的缓存状态。
+- 构建命令、实机结果和控制器开销比较见 [本轮记录](docs/runtime_cleanup_20261027.md)。
+
+## 此前部署验证（未启用密码路径）
 
 - 本地库重新编译成功，17 项单元测试通过。
 - 使用新 start.sh 在 8 卡 70B 模型上完成启动，健康检查返回 HTTP 200。

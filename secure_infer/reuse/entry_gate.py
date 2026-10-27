@@ -2,7 +2,6 @@
 
 No profile is loaded. Coefficients describe effective stream intervals with
 explicit layer waits subtracted; they are not isolated kernel measurements.
-The margin is an empirical residual, not a confidence bound.
 """
 import json
 import os
@@ -12,7 +11,8 @@ import numpy as np
 from .completion_model import pipeline_finish
 from scipy.optimize import nnls
 
-_seen = set()
+_model_cache = None
+_model_key = None
 _compute = []
 _loads = []
 _timeline_offset = 0
@@ -34,9 +34,6 @@ def update():
     for line in lines:
         row = json.loads(line)
         rid = row['request_id']
-        if rid in _seen:
-            continue
-        _seen.add(rid)
         # flush() emits this trace only after every marker and the complete
         # prefill have physically finished. Only completed own observations train.
         observations = []
@@ -72,6 +69,10 @@ def update():
 
 
 def costs():
+    global _model_cache, _model_key
+    key=(tuple(id(x) for x in _compute),tuple(id(x) for x in _loads))
+    if key == _model_key:
+        return _model_cache
     if not _compute or not _loads:
         return None
     x = np.array([[1., s['tokens']/1024,
@@ -95,8 +96,8 @@ def costs():
     model=dict(step_ms=float(step),a=float(a),b=float(b),phi=float(phi),lam=float(lam),
                load_curve=curve,compute_samples=len(_compute),load_samples=len(_loads),
                training_request_ids=sorted({s['request_id'] for s in _compute+_loads}))
-    model['residual_ms']=float(np.mean(np.abs(x@np.array([step,a,b])-y))+
-        np.mean([abs(load_ms(model,s['tokens'])-s['service_ms']) for s in _loads]))
+    _model_key=key
+    _model_cache=model
     return model
 
 
@@ -132,7 +133,15 @@ def choose(r, u, chunk, layers):
     qs = np.array(sorted(set(range(0,r,128)) | {r}), dtype=np.int64)
     suffix = compute_ms(model,u,r)
     head = model.get('step_ms',0.)*np.ceil(qs/chunk)+model['a']*qs/1024+model['b']*(qs/1024)**2/2
-    service = np.array([load_ms(model,int(r-q)) for q in qs])
+    ns=r-qs
+    curve=model.get('load_curve')
+    if curve:
+        xs=np.array([0.]+[float(x) for x,_ in curve]);ys=np.array([0.]+[float(y) for _,y in curve])
+        service=np.interp(ns,xs,ys)
+        slope=max(0.,(ys[-1]-ys[-2])/(xs[-1]-xs[-2]),model.get('lam',0.)/1024)
+        service=np.where(ns>xs[-1],ys[-1]+slope*(ns-xs[-1]),service)
+    else:
+        service=np.where(ns>0,model['phi']+model['lam']*ns/1024,0.)
     # Load observations include their setup cost. Equal layer service/compute
     # remains an approximation; the complete-recompute endpoint has no load.
     pipeline = pipeline_finish(suffix,service,layers)
@@ -141,7 +150,7 @@ def choose(r, u, chunk, layers):
     best = int(np.argmin(finish))
     best_q = int(qs[best])
     gain = float(finish[0]-finish[best])
-    if gain <= model['residual_ms']:
+    if best_q == 0:
         policy,mode,q = 'load','native',0
     elif best_q == r:
         policy,mode,q = 'compute','compute',r

@@ -1,25 +1,19 @@
 """Native layer generator integrated with existing offload storage and crypto."""
-import ast
 import ctypes
 from dataclasses import dataclass, field
 import json
-import logging
 import os
-import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
 
 import numpy as np
 import torch
-from vllm.config import get_layers_from_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1, KVConnectorRole
 try:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorWorkerMetadata
 except ImportError:
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata as KVConnectorWorkerMetadata
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
 from vllm_ascend.kv_offload.cpu_npu import expand_block_ids
@@ -104,9 +98,6 @@ class NativeTransfer:
         self.begin=self.rt.secure_infer_h2d_layer_group_begin
         self.begin.argtypes=[ctypes.c_size_t]
         self.end=self.rt.secure_infer_h2d_layer_group_end
-        # The unchanged Fig.1 binary has no diagnostic batching symbol.
-        # Batch execution remains disabled by the original protocol.
-        self.stats=None
         self.cpu_stats=self.rt.secure_infer_get_transfer_prefetch_stats
         self.cpu_stats.argtypes=[ctypes.POINTER(ctypes.c_uint64)]*3
         self.cpu_stats.restype=None
@@ -123,13 +114,6 @@ class NativeTransfer:
         names=['cpu_ready','cpu_busy','cpu_missing','key_ready','key_busy','key_missing',
             'key_aicpu_submitted','key_aicore_submitted','key_dropped','key_switches']
         return dict(zip(names,[x.value for x in cpu+key]))
-
-    def batch_counts(self):
-        launches=ctypes.c_uint64()
-        records=ctypes.c_uint64()
-        if self.stats is not None:
-            self.stats(ctypes.byref(launches),ctypes.byref(records))
-        return launches.value,records.value
 
     def single_layer_kv_transfer(self, payload, destination, slots, to_cpu, kv_format, token_major, two_major):
         assert not to_cpu
@@ -233,7 +217,6 @@ class NativeWorker(SecureInferOffloadingConnectorWorker):
         self.ops=NativeTransfer(self.handler)
         self.ops.causal_group_blocks=int(os.environ.get("RUNTIME_LOAD_CHUNK","2048"))//128
         self.native=LayerwiseGenerator(self.ops)
-        self.native.use_gpu=False
         self.native.num_layers=len(caches)
         from secure_infer.reuse.timing_hooks import install
         install(self)
@@ -241,7 +224,6 @@ class NativeWorker(SecureInferOffloadingConnectorWorker):
         self.native.kvcaches=self.handler.npu_tensors
         self.native.kv_format=SimpleNamespace(value=2)
         self.native.vllm_two_major=False
-        self.native.initialize_kvcaches_ptr=lambda **kwargs:None
 
     def start_kv_transfers(self,metadata):
         assert self.active is None
@@ -260,35 +242,13 @@ class NativeWorker(SecureInferOffloadingConnectorWorker):
         self.handler._record_h2d_geometry(job_id=job,logical_block_count=len(src.block_ids),physical_block_count=len(mapping))
         log('jobs.jsonl',dict(job_id=job,request_id=req))
         self.ops.layer=0
-        before=self.ops.batch_counts()
         path_before=self.ops.path_counts()
         self.ops.retained=[tensor]
         payload=[SimpleNamespace(tensor=(host,tensor)) for host in self.handler.cpu_tensors]
         gen=self.native.batched_to_gpu([0],[len(mapping)],slot_mapping=torch.arange(len(mapping)),sync=True)
         next(gen)
         gen.send([payload[0]])
-        self.active=dict(req=req,job=job,payload=payload,gen=gen,index=0,batch_before=before,path_before=path_before,expected_records=2*len(mapping)*len(self.names))
-        if MODE=='serial':
-            for item in payload[1:]:
-                gen.send([item])
-            next(gen)
-            self.native.load_stream.synchronize()
-            for layer in range(len(self.names)):
-                assert self.wait_auth(layer)==0
-                log('layer_waits.jsonl',dict(request_id=req,layer=layer,mode=MODE,completed=True))
-            gen.close()
-            after=self.ops.batch_counts()
-            log('batch_stats.jsonl',dict(request_id=req,job_id=job,mode=MODE,
-                expected_records=self.active['expected_records'],batch_launches=after[0]-before[0],
-                batched_records=after[1]-before[1]))
-            counters=self.ops.path_counts()
-            log('path_counters.jsonl',dict(request_id=req,job_id=job,
-                records=self.active['expected_records'],**{k:v-path_before[k] for k,v in counters.items()}))
-            self.completed.add(req)
-            _retire_h2d_prediction_scope()
-            self.check_loaded_bytes(self.active)
-            self.active=None
-            self.retain_copy_inputs()
+        self.active=dict(req=req,job=job,payload=payload,gen=gen,index=0,path_before=path_before,expected_records=2*len(mapping)*len(self.names))
 
     def wait_for_layer_load(self,name):
         if self.active is None:
@@ -300,15 +260,10 @@ class NativeWorker(SecureInferOffloadingConnectorWorker):
             a['gen'].send([a['payload'][layer+1]])
         else:
             next(a['gen'])
-        if MODE!='plain':
-            assert self.wait_auth(layer)==0,'Authentication failure blocks consumption'
+        assert self.wait_auth(layer)==0,'Authentication failure blocks consumption'
         log('layer_waits.jsonl',dict(request_id=a['req'],layer=layer,mode=MODE,completed=True))
         a['index']+=1
         if a['index']==len(self.names):
-            after=self.ops.batch_counts()
-            log('batch_stats.jsonl',dict(request_id=a['req'],job_id=a['job'],mode=MODE,
-                expected_records=a['expected_records'],batch_launches=after[0]-a['batch_before'][0],
-                batched_records=after[1]-a['batch_before'][1]))
             counters=self.ops.path_counts()
             log('path_counters.jsonl',dict(request_id=a['req'],job_id=a['job'],
                 records=a['expected_records'],**{k:v-a['path_before'][k] for k,v in counters.items()}))

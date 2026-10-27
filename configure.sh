@@ -17,3 +17,6 @@ fi
 : "${ASCEND_ROOT:?请在 .env 中设置 ASCEND_ROOT}"
 "${PYTHON:-python3}" -c 'import torch, torch_npu, vllm, vllm_ascend; print("推理依赖检查通过")'
 make lib
+if [[ "${SERVE_MODE:-runtime}" == runtime ]]; then
+  make ghash-aicpu
+fi

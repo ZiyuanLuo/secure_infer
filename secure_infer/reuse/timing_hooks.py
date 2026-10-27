@@ -1,6 +1,5 @@
 """Observation-only NPU stream markers, collected after forward completion."""
 import time
-import re
 import torch
 
 _installed=False
@@ -41,8 +40,12 @@ def install(worker):
     def execute(self,scheduler_output,*args,**kwargs):
         global _current
         flush()
+        positions={r.req_id:r.num_computed_tokens for r in scheduler_output.scheduled_new_reqs}
+        cached=scheduler_output.scheduled_cached_reqs
+        positions.update(zip(cached.req_ids,cached.num_computed_tokens))
+        new_lengths={r.req_id:len(r.prompt_token_ids) for r in scheduler_output.scheduled_new_reqs}
         measured=[rid for rid,n in scheduler_output.num_scheduled_tokens.items()
-            if n>1]
+            if n>0 and positions[rid] < (new_lengths[rid] if rid in new_lengths else self.requests[rid].num_prompt_tokens)]
         if not measured:return old_execute(self,scheduler_output,*args,**kwargs)
         assert len(measured)==1
         rid=measured[0]

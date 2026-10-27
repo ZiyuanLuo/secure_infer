@@ -4,8 +4,8 @@
 from .completion_model import pipeline_finish
 
 def decide(*, q, r, u, observed, now_ns, step_ms, step_tokens, layers,
-           layer_after_stop=True, compare_next=True, suffix_ms_override=None,
-           next_compute_ms_override=None, error_margin_ms=0., queued_compute_ms=0.):
+           suffix_ms_override=None,
+           next_compute_ms_override=None, queued_compute_ms=0.):
     result = dict(stop=False, reason='insufficient current-request observations',
                   q=q, R=r, U=u, offline_profile_used=False)
     if step_tokens <= 0 or step_ms <= 0:
@@ -37,7 +37,6 @@ def decide(*, q, r, u, observed, now_ns, step_ms, step_tokens, layers,
         pending_ms = 0.
         gap = max(0, observed['ready'] - q)
     remaining_ms = pending_ms + load_per_token * gap
-    credit_ms = suffix_ms * (1 - 1 / layers)
     stop_finish = max(queued_compute_ms+suffix_ms,
                       float(pipeline_finish(suffix_ms,remaining_ms,layers)))
     # Next nonpreemptible compute step takes time; it removes that many
@@ -48,20 +47,18 @@ def decide(*, q, r, u, observed, now_ns, step_ms, step_tokens, layers,
     compute_start=queued_compute_ms
     if pending and pending[0] < q+next_tokens and pending[1] > q:
         # The next head step overwrites part of an already committed load;
-        # preserve the existing write-before-overwrite dependency.
+        # preserve the existing write-after-write dependency.
         compute_start=max(compute_start,pending_ms)
     more_finish = max(compute_start + next_compute + suffix_ms,
                       float(pipeline_finish(suffix_ms,
                           pending_ms+load_per_token*max(0,gap-next_tokens),layers)))
-    stop = stop_finish-more_finish <= error_margin_ms if compare_next else remaining_ms <= credit_ms
+    stop = stop_finish <= more_finish
     result.update(stop=stop,
-                  reason='online STOP/MORE comparison' if compare_next else
-                         'suffix credit versus remaining secure load',
+                  reason='online STOP/MORE comparison',
                   compute_per_token_ms=per_token, load_per_token_ms=load_per_token,
-                  suffix_ms=suffix_ms, credit_ms=credit_ms,queued_compute_ms=queued_compute_ms,
+                  suffix_ms=suffix_ms, queued_compute_ms=queued_compute_ms,
                   remaining_ms=remaining_ms, pending_remaining_ms=pending_ms,
                   uncovered_tokens=gap, observation_source=source,
-                  layer_after_stop=layer_after_stop,
-                  stop_finish_ms=stop_finish, more_finish_ms=more_finish, error_margin_ms=error_margin_ms)
+                  stop_finish_ms=stop_finish, more_finish_ms=more_finish)
     result['history_suffix_used'] = suffix_ms_override is not None
     return result
