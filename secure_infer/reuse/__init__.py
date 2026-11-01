@@ -1,1 +1,1 @@
-"""Online prefix-reuse decisions and their vLLM execution path."""
+"""Static suffix-aware split selection with inter-request cost calibration."""

@@ -25,7 +25,7 @@ CFLAGS := -std=c++17 -fPIC -O2 -Wall -MMD -MP
 LDFLAGS := -shared -fPIC -lpthread -ldl
 NATIVE_DIR := secure_infer/native
 LIB_SOURCES := $(NATIVE_DIR)/secure_infer.cpp $(NATIVE_DIR)/worker.cpp $(NATIVE_DIR)/openssl.cpp
-LIB_OBJECTS := $(LIB_SOURCES:.cpp=.o)
+LIB_OBJECTS := $(LIB_SOURCES:.cpp=.o) $(NATIVE_DIR)/kernels/aicpu/monocypher/monocypher.o
 DEPFILES := $(LIB_OBJECTS:.o=.d)
 OUTPUT_LIB ?= libsecure_infer.so
 
@@ -40,6 +40,9 @@ $(OUTPUT_LIB): $(LIB_OBJECTS)
 
 %.o: %.cpp
 	$(CXX) $(CFLAGS) -I$(ACL_INC) $(OPENSSL_INC) -c $< -o $@
+
+$(NATIVE_DIR)/kernels/aicpu/monocypher/monocypher.o: $(NATIVE_DIR)/kernels/aicpu/monocypher/monocypher.c
+	$(CXX) $(CFLAGS) -c $< -o $@
 
 ghash-aicpu:
 	cmake -S $(NATIVE_DIR)/kernels/aicpu -B $(NATIVE_DIR)/kernels/aicpu/build \

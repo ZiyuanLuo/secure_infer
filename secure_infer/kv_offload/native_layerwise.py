@@ -1,30 +1,15 @@
-"""Native layer generator integrated with existing offload storage and crypto."""
+"""Native layer transfer integrated with existing offload storage and crypto."""
 import ctypes
 from dataclasses import dataclass, field
 import json
 import os
-import time
 from pathlib import Path
 from types import SimpleNamespace
 
-import numpy as np
 import torch
-from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1, KVConnectorRole
-try:
-    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorWorkerMetadata
-except ImportError:
-    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata as KVConnectorWorkerMetadata
-from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
-from vllm_ascend.kv_offload.cpu_npu import expand_block_ids
-from secure_infer.kv_offload.npu_predict import NPUOffloadingSpec, _retire_h2d_prediction_scope
-from .secure_connector import (SecureInferOffloadingConnector, SecureInferOffloadingConnectorWorker,
-    SecureInferOffloadingConnectorScheduler, SecureInferOffloadingConnectorMetadata,
-    SecureInferSecureStoreMetadata)
-
-from .layerwise_generator import LayerwiseGenerator
-
-MODE="native_secure"
+from .secure_connector import (SecureInferOffloadingConnectorWorker,
+    SecureInferOffloadingConnectorScheduler, SecureInferSecureStoreMetadata)
 
 def log(name, row):
     with (Path(os.environ["RUNTIME_RESULT_DIR"])/name).open("a") as out:
@@ -33,10 +18,13 @@ def log(name, row):
 @dataclass
 class NativeMetadata(SecureInferSecureStoreMetadata):
     completed_native_loads: set[str] = field(default_factory=set)
+    native_load_ready_counts: dict[str, int] = field(default_factory=dict)
 
     def aggregate(self, other):
         super().aggregate(other)
         self.completed_native_loads.update(other.completed_native_loads)
+        for rid,count in other.native_load_ready_counts.items():
+            self.native_load_ready_counts[rid]=self.native_load_ready_counts.get(rid,0)+count
         return self
 
 class NativeScheduler(SecureInferOffloadingConnectorScheduler):
@@ -80,7 +68,13 @@ class NativeScheduler(SecureInferOffloadingConnectorScheduler):
             super().update_connector_output(output)
             meta=getattr(output, "kv_connector_worker_meta", None)
             if isinstance(meta,NativeMetadata):
-                for req in meta.completed_native_loads:
+                if not hasattr(self, '_native_load_worker_counts'):
+                    self._native_load_worker_counts={}
+                counts=meta.native_load_ready_counts or {rid:1 for rid in meta.completed_native_loads}
+                for req,count in counts.items():
+                    self._native_load_worker_counts[req]=self._native_load_worker_counts.get(req,0)+count
+                    if self._native_load_worker_counts[req]<self._secure_ready_expected_workers:continue
+                    del self._native_load_worker_counts[req]
                     hashes=self._reqs_being_loaded.pop(req,None)
                     if hashes:
                         if self._blocks_being_loaded is not None:
@@ -90,7 +84,6 @@ class NativeScheduler(SecureInferOffloadingConnectorScheduler):
 
 class NativeTransfer:
     def __init__(self, handler):
-        self.handler=handler
         self.streams=handler._h2d_slice_streams
         self.retained=[]
         self.layer=0
@@ -98,25 +91,7 @@ class NativeTransfer:
         self.begin=self.rt.secure_infer_h2d_layer_group_begin
         self.begin.argtypes=[ctypes.c_size_t]
         self.end=self.rt.secure_infer_h2d_layer_group_end
-        self.cpu_stats=self.rt.secure_infer_get_transfer_prefetch_stats
-        self.cpu_stats.argtypes=[ctypes.POINTER(ctypes.c_uint64)]*3
-        self.cpu_stats.restype=None
-        self.key_stats=self.rt.secure_infer_get_gcm_keystream_stats
-        self.key_stats.argtypes=[ctypes.POINTER(ctypes.c_uint64)]*7
-        self.key_stats.restype=None
-
-    def path_counts(self):
-        # Read-only cumulative counters; no event wait, prediction or status consumption.
-        cpu=[ctypes.c_uint64() for _ in range(3)]
-        key=[ctypes.c_uint64() for _ in range(7)]
-        self.cpu_stats(*(ctypes.byref(x) for x in cpu))
-        self.key_stats(*(ctypes.byref(x) for x in key))
-        names=['cpu_ready','cpu_busy','cpu_missing','key_ready','key_busy','key_missing',
-            'key_aicpu_submitted','key_aicore_submitted','key_dropped','key_switches']
-        return dict(zip(names,[x.value for x in cpu+key]))
-
-    def single_layer_kv_transfer(self, payload, destination, slots, to_cpu, kv_format, token_major, two_major):
-        assert not to_cpu
+    def single_layer_kv_transfer(self, payload, destination):
         host,mapping=payload
         group=getattr(self,'causal_group_blocks',0)
         if group and len(mapping)>group:
@@ -129,8 +104,7 @@ class NativeTransfer:
                 while end>0:
                     start=max(0,end-group)
                     self.layer=layer
-                    self.single_layer_kv_transfer((host,mapping[start:end]),destination,
-                        slots,to_cpu,kv_format,token_major,two_major)
+                    self.single_layer_kv_transfer((host,mapping[start:end]),destination)
                     end=start
             finally:
                 self.causal_group_blocks=group
@@ -158,8 +132,6 @@ class NativeTransfer:
 class NativeWorker(SecureInferOffloadingConnectorWorker):
     def __init__(self,spec):
         super().__init__(spec)
-        self.active=None
-        self.completed=set()
         self.retained=[]
         self.wait_auth=ctypes.CDLL(None).secure_infer_recovery_wait_layer_authentication
         self.wait_auth.argtypes=[ctypes.c_uint32]
@@ -178,18 +150,6 @@ class NativeWorker(SecureInferOffloadingConnectorWorker):
                 if job in self._jobs}
         self.retained=[(event,refs) for event,refs in self.retained if not event.query()]
         return result
-
-    def check_loaded_bytes(self, active):
-        if os.environ.get("RUNTIME_CHECK_LOADED_BYTES")!="1":
-            return
-        host,mapping=active["payload"][0].tensor
-        src=mapping[:,0].long()
-        dst=mapping[:,1].long()
-        self.native.load_stream.synchronize()
-        for layer,(host,device) in enumerate(zip(self.handler.cpu_tensors,self.handler.npu_tensors)):
-            for kind,(h,d) in enumerate(zip(host,device)):
-                assert torch.equal(h[src],d[dst.to(device=d.device)].cpu()),(layer,kind)
-        log("byte_checks.jsonl",dict(request_id=active["req"],layers=len(self.names),records=2*len(src)*len(self.names),exact=True))
 
     def register_kv_caches(self,caches):
         super().register_kv_caches(caches)
@@ -216,79 +176,7 @@ class NativeWorker(SecureInferOffloadingConnectorWorker):
         self.handler._submit_transfer=submit_after_producer
         self.ops=NativeTransfer(self.handler)
         self.ops.causal_group_blocks=int(os.environ.get("RUNTIME_LOAD_CHUNK","2048"))//128
-        self.native=LayerwiseGenerator(self.ops)
-        self.native.num_layers=len(caches)
+        self.native=SimpleNamespace(num_layers=len(caches),load_stream=self.handler.h2d_stream,
+            kvcaches=self.handler.npu_tensors)
         from secure_infer.reuse.timing_hooks import install
         install(self)
-        self.native.load_stream=self.handler.h2d_stream
-        self.native.kvcaches=self.handler.npu_tensors
-        self.native.kv_format=SimpleNamespace(value=2)
-        self.native.vllm_two_major=False
-
-    def start_kv_transfers(self,metadata):
-        assert self.active is None
-        super().start_kv_transfers(SecureInferOffloadingConnectorMetadata(reqs_to_load={},reqs_to_store=metadata.reqs_to_store))
-        if not metadata.reqs_to_load:
-            return
-        assert len(metadata.reqs_to_load)==1,'This sequential benchmark requires one reload per model step'
-        req,spec=next(iter(metadata.reqs_to_load.items()))
-        job=self._generate_job_id()
-        src,dst=spec
-        factor=self.handler.block_size_factor
-        mapping=np.empty((len(src.block_ids)*factor,2),dtype=np.int64)
-        expand_block_ids(src.block_ids,factor,mapping[:,0])
-        expand_block_ids(dst.block_ids,1,mapping[:,1])
-        tensor=torch.from_numpy(mapping)
-        self.handler._record_h2d_geometry(job_id=job,logical_block_count=len(src.block_ids),physical_block_count=len(mapping))
-        log('jobs.jsonl',dict(job_id=job,request_id=req))
-        self.ops.layer=0
-        path_before=self.ops.path_counts()
-        self.ops.retained=[tensor]
-        payload=[SimpleNamespace(tensor=(host,tensor)) for host in self.handler.cpu_tensors]
-        gen=self.native.batched_to_gpu([0],[len(mapping)],slot_mapping=torch.arange(len(mapping)),sync=True)
-        next(gen)
-        gen.send([payload[0]])
-        self.active=dict(req=req,job=job,payload=payload,gen=gen,index=0,path_before=path_before,expected_records=2*len(mapping)*len(self.names))
-
-    def wait_for_layer_load(self,name):
-        if self.active is None:
-            return
-        a=self.active
-        layer=a['index']
-        assert name==self.names[layer],(name,self.names[layer])
-        if layer+1<len(self.names):
-            a['gen'].send([a['payload'][layer+1]])
-        else:
-            next(a['gen'])
-        assert self.wait_auth(layer)==0,'Authentication failure blocks consumption'
-        log('layer_waits.jsonl',dict(request_id=a['req'],layer=layer,mode=MODE,completed=True))
-        a['index']+=1
-        if a['index']==len(self.names):
-            counters=self.ops.path_counts()
-            log('path_counters.jsonl',dict(request_id=a['req'],job_id=a['job'],
-                records=a['expected_records'],**{k:v-a['path_before'][k] for k,v in counters.items()}))
-            a['gen'].close()
-            self.completed.add(a['req'])
-            _retire_h2d_prediction_scope()
-            self.check_loaded_bytes(self.active)
-            self.active=None
-            self.retain_copy_inputs()
-
-    def take_secure_store_metadata(self):
-        store=super().take_secure_store_metadata()
-        if not store and not self.completed:
-            return None
-        result=NativeMetadata(secure_store_ready_counts=store.secure_store_ready_counts if store else {},completed_native_loads=self.completed)
-        self.completed=set()
-        return result
-
-class NativeLayerConnector(SecureInferOffloadingConnector):
-    def __init__(self,config,role,kv_cache_config=None):
-        KVConnectorBase_V1.__init__(self,config,role,kv_cache_config)
-        spec=OffloadingSpecFactory.create_spec(config,kv_cache_config)
-        self.connector_scheduler=NativeScheduler(spec) if role==KVConnectorRole.SCHEDULER else None
-        self.connector_worker=NativeWorker(spec) if role==KVConnectorRole.WORKER else None
-
-    def wait_for_layer_load(self,layer_name):
-        if self.connector_worker:
-            self.connector_worker.wait_for_layer_load(layer_name)

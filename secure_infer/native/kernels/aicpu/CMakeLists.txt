@@ -8,7 +8,7 @@ set(AICPU_AES_INTERLEAVE "4" CACHE STRING "AICPU AES-CTR interleave factor")
 set(AICPU_GHASH_FOLD "8" CACHE STRING "AICPU GHASH fold factor")
 set(AICPU_GHASH_MULTICHAIN "0" CACHE STRING "AICPU GHASH multi-chain factor")
 
-add_library(runtime_aicpu_ghash SHARED ghash.aicpu launcher.asc)
+add_library(runtime_aicpu_ghash SHARED ghash.aicpu key_agreement.aicpu launcher.asc)
 set_target_properties(runtime_aicpu_ghash PROPERTIES LINKER_LANGUAGE ASC)
 target_compile_options(
   runtime_aicpu_ghash PRIVATE

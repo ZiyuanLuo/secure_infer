@@ -18,7 +18,6 @@
 #include <condition_variable>
 #include <vector>
 #include <set>
-#include <map>
 #include <unordered_map>
 #include <algorithm>
 #include <stdio.h>
@@ -41,7 +40,6 @@
 #include <memory>
 #include <pthread.h>
 #include <sys/resource.h>
-#include <unistd.h> // 注意：您包含了两次 unistd.h，这里保留
 
 extern size_t encrypt_magic_sz;
 extern size_t decrypt_magic_sz;
@@ -248,12 +246,6 @@ struct encryption_task {
     // distinct transfer_block_offset.
     uint32_t ticket_batch_members = 1;
     size_t ticket_batch_bytes = 0;
-    // CPU ciphertext preparation is lightweight host work; NPU keystream
-    // admission allocates device slabs/events and launches AICPU kernels.
-    // Keep their progress independent so an NPU admission deadline never
-    // prevents CPU preparation from running ahead.
-    bool cpu_prefetch_admitted = false;
-    bool npu_prefetch_admitted = false;
 };
 struct commit_sync_state {
     aclrtEvent event = nullptr;
@@ -267,7 +259,6 @@ struct commit_task {
     encryption_task enc_task;
     void *dst;
     bool using_predict;
-    bool update_predict_iv;
     std::shared_ptr<commit_sync_state> sync;
     uint64_t profile_start_us = 0;
 };
@@ -547,8 +538,6 @@ struct Predictor {
     // For read-only swap（原有）
     std::vector<std::pair<const void *, size_t>> read_only_swap_record;
     bool read_only_swap_profiled = false;
-    int read_only_swap_cur_idx = 0;
-    int read_only_swap_pred_idx = 0;
 
     // For other swaps（原有）
     std::vector<std::pair<const void *, size_t>> other_swap_record;
@@ -558,9 +547,7 @@ struct Predictor {
     std::deque<std::pair<const void*, std::pair<void *, size_t>>> pending_commit;
     std::deque<decryption_task> pending_decrypt;
 
-    // ==================== 新增：线性预测模式（vLLM 支持） ====================
     bool linear_mode = false;
-    void* linear_base = nullptr;
     size_t linear_stride = 0;
     const void* linear_expected_src = nullptr;
     const void* linear_prefetch_until = nullptr;  // exclusive: first address not yet scheduled

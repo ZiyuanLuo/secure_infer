@@ -16,6 +16,7 @@ _model_key = None
 _compute = []
 _loads = []
 _timeline_offset = 0
+_rank_timelines = {}
 
 
 def root():
@@ -34,10 +35,28 @@ def update():
     for line in lines:
         row = json.loads(line)
         rid = row['request_id']
+        world = row.get('world_size', 1)
+        if world > 1:
+            ranks = _rank_timelines.setdefault(rid, {})
+            ranks[row['rank']] = row
+            if len(ranks) < world:
+                continue
+            peers = list(_rank_timelines.pop(rid).values())
+            # The slowest TP rank determines completion, rather than the
+            # sum or average of rank-local observations.
+            row = dict(max(peers, key=lambda r:
+                sum(x['stream_span_ms'] for x in r['steps']) -
+                sum(x['stream_span_ms'] for x in r['gates'])))
+            row['loads'] = max(peers, key=lambda r:
+                sum(x['stream_span_ms'] for x in r['loads']))['loads']
         # flush() emits this trace only after every marker and the complete
         # prefill have physically finished. Only completed own observations train.
-        observations = []
         for step in row['steps']:
+            # A standalone short tail exposes input/launch startup differently
+            # from a chunk in a continuous prefill. Keep full-pass observations
+            # and all steps from multi-chunk requests in the calibration window.
+            if len(row['steps']) == 1 and step['tokens'] < int(os.environ.get('RUNTIME_COMPUTE_CHUNK','1024')):
+                continue
             gates = [g for g in row['gates']
                      if step['start_ms'] <= g['start_ms'] and
                      g['end_ms'] <= step['end_ms']]
@@ -47,8 +66,9 @@ def update():
                 sample = dict(request_id=rid, tokens=step['tokens'],
                               position=step['position'], service_ms=duration,
                               raw_ms=step['stream_span_ms'], gate_ms=blocked)
+                # Retain recent observations rather than replacing a shape
+                # with its latest measurement from a different execution state.
                 _compute.append(sample)
-                observations.append(dict(kind='compute', **sample))
         # Each copy marker encloses the physical layer service. Sum active
         # intervals, excluding idle gaps caused by native consumption callbacks.
         # Only complete layer groups are eligible for the load fit.
@@ -60,10 +80,6 @@ def update():
             sample=dict(request_id=rid,tokens=counts[0]*128,layers=row['layers'],
                         service_ms=sum(x['stream_span_ms'] for x in row['loads']))
             _loads.append(sample)
-            observations.append(dict(kind='load',**sample))
-        with (root()/'entry_training.jsonl').open('a') as out:
-            for sample in observations:
-                out.write(json.dumps(dict(observed_ns=time.monotonic_ns(), **sample))+'\n')
     del _compute[:-64]
     del _loads[:-32]
 
@@ -90,39 +106,52 @@ def costs():
         # A single size cannot identify an independent startup cost.
         phi = 0.
         lam = float(np.median(load_y/load_x[:, 1]))
-    sizes=sorted({s['tokens'] for s in _loads})
-    values=np.maximum.accumulate([float(np.median([s['service_ms'] for s in _loads if s['tokens']==n])) for n in sizes])
-    curve=list(zip(sizes,values.tolist()))
     model=dict(step_ms=float(step),a=float(a),b=float(b),phi=float(phi),lam=float(lam),
-               load_curve=curve,compute_samples=len(_compute),load_samples=len(_loads),
-               training_request_ids=sorted({s['request_id'] for s in _compute+_loads}))
+               compute_samples=len(_compute),load_samples=len(_loads),
+               training_request_ids=sorted({s['request_id'] for s in _compute+_loads}),
+)
     _model_key=key
     _model_cache=model
     return model
 
 
-def load_ms(model,n):
-    if n<=0:return 0.
-    curve=model.get('load_curve')
-    if not curve:return model['phi']+model['lam']*n/1024
-    xs=[0.]+[float(x) for x,_ in curve]
-    ys=[0.]+[float(y) for _,y in curve]
-    if n<=xs[-1]:return float(np.interp(n,xs,ys))
-    # Do not extrapolate a noisy terminal plateau as free additional bytes.
-    slope=max(0.,(ys[-1]-ys[-2])/(xs[-1]-xs[-2]),model.get('lam',0.)/1024)
-    return ys[-1]+slope*(n-xs[-1])
+def load_ms(model, n):
+    values = np.asarray(n, dtype=float)
+    result = np.where(values > 0,
+                      model['phi'] + model['lam'] * values / 1024,
+                      0.)
+    return result.item() if result.ndim == 0 else result
 
 
 def compute_ms(model, n, context=0):
     return (model.get('step_ms',0.) if n>0 else 0.)+model['a']*n/1024 + model['b']*(n/1024)*(context+n/2)/1024
 
 
-def head_ms(model,n,chunk):
-    return (model.get('step_ms',0.)*int(np.ceil(n/chunk))+
-            model['a']*n/1024+model['b']*(n/1024)**2/2)
+def head_ms(model, n, chunk):
+    values = np.asarray(n, dtype=float)
+    result = (model.get('step_ms', 0.) * np.ceil(values / chunk) +
+              model['a'] * values / 1024 +
+              model['b'] * (values / 1024) ** 2 / 2)
+    return result.item() if result.ndim == 0 else result
 
 def choose(r, u, chunk, layers):
     begin = time.monotonic_ns()
+    force_q = os.environ.get('RUNTIME_FORCE_Q', '')
+    if force_q != '':
+        fq = int(force_q)
+        assert 0 <= fq <= r and fq % 128 == 0, (fq, r)
+        if fq == 0:
+            policy, mode, q = 'load', 'native', 0
+        elif fq == r:
+            policy, mode, q = 'compute', 'compute', r
+        else:
+            policy, mode, q = 'hybrid', 'hybrid', fq
+        return dict(policy=policy, entry_mode=mode, q=q,
+                    predicted_q=q, predicted_native_ms=0.0,
+                    predicted_best_ms=0.0, predicted_gain_ms=0.0,
+                    suffix_ms=0.0, model=None, offline_profile_used=False,
+                    reason='forced by RUNTIME_FORCE_Q',
+                    decision_ns=time.monotonic_ns()-begin)
     update()
     model = costs()
     if model is None:
@@ -132,16 +161,9 @@ def choose(r, u, chunk, layers):
                     decision_ns=time.monotonic_ns()-begin)
     qs = np.array(sorted(set(range(0,r,128)) | {r}), dtype=np.int64)
     suffix = compute_ms(model,u,r)
-    head = model.get('step_ms',0.)*np.ceil(qs/chunk)+model['a']*qs/1024+model['b']*(qs/1024)**2/2
+    head = head_ms(model, qs, chunk)
     ns=r-qs
-    curve=model.get('load_curve')
-    if curve:
-        xs=np.array([0.]+[float(x) for x,_ in curve]);ys=np.array([0.]+[float(y) for _,y in curve])
-        service=np.interp(ns,xs,ys)
-        slope=max(0.,(ys[-1]-ys[-2])/(xs[-1]-xs[-2]),model.get('lam',0.)/1024)
-        service=np.where(ns>xs[-1],ys[-1]+slope*(ns-xs[-1]),service)
-    else:
-        service=np.where(ns>0,model['phi']+model['lam']*ns/1024,0.)
+    service = load_ms(model, ns)
     # Load observations include their setup cost. Equal layer service/compute
     # remains an approximation; the complete-recompute endpoint has no load.
     pipeline = pipeline_finish(suffix,service,layers)
@@ -155,12 +177,10 @@ def choose(r, u, chunk, layers):
     elif best_q == r:
         policy,mode,q = 'compute','compute',r
     else:
-        # Keep the existing live pending-write/coverage controller. Predicted
-        # q is not forced as an oracle split; it only admits the hybrid path.
-        policy,mode,q = 'mixed','mixed',None
+        policy,mode,q = 'hybrid','hybrid',best_q
     return dict(policy=policy, entry_mode=mode, q=q,
                 predicted_q=best_q, predicted_native_ms=float(finish[0]),
                 predicted_best_ms=float(finish[best]), predicted_gain_ms=gain,
                 suffix_ms=suffix, model=model, offline_profile_used=False,
-                reason='online entry three-way comparison',
+                reason='minimum estimated TTFT before prefill',
                 decision_ns=time.monotonic_ns()-begin)

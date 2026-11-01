@@ -11,7 +11,6 @@
 #include <strings.h>
 #include <chrono>
 #include <cassert>
-#include <dlfcn.h>
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
@@ -26,6 +25,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <openssl/rand.h>
+#include "kernels/aicpu/monocypher/monocypher.h"
 std::mutex g_ctx_map_mutex;
 static bool enable_h2d_encrypt = false;
 static bool enable_d2h_encrypt = false;
@@ -53,9 +53,8 @@ std::thread *decrypt_manager_threads[decrypt_workers_num_max];
 
 Predictor predictor;
 void sync_predictor();
-void assign_to_workers(void *dst, const void *src, size_t count, bool decrypt,
-                       bool predict, bool commit, bool update_predict_iv,
-                       bool batch_commit, aclrtStream user_stream,
+void assign_to_workers(void *dst, const void *src, size_t count,
+                       bool predict, bool commit, aclrtStream user_stream,
                        uint64_t transfer_ticket = 0,
                        uint64_t transfer_block_offset = 0,
                        uint64_t prefetch_group_id = 0);
@@ -240,6 +239,10 @@ bool secure_infer_gcm_aad_enabled()
 
 static void init_transfer_iv_session()
 {
+    if (secure_infer_gcm_enabled()) {
+        g_transfer_session_nonce = 0;
+        return;
+    }
     uint64_t nonce = 0;
     if (RAND_bytes(reinterpret_cast<unsigned char*>(&nonce), sizeof(nonce)) != 1) {
         // RAND_bytes should be available through libcrypto.  Keep a robust
@@ -441,6 +444,82 @@ static void secure_infer_preload_gcm_aicpu_image()
     }
 }
 
+// Experimental unauthenticated session setup. The host and AICPU exchange
+// public values only; the device key and H are never copied across PCIe.
+static bool secure_infer_experimental_device_session(encrypt_metadata& metadata)
+{
+    if (!load_ghash_library()) return false;
+    using LaunchAgreement = int (*)(void*, void*, void*, void*, void*, void*, void*);
+    auto launch = reinterpret_cast<LaunchAgreement>(
+        dlsym(g_ghash_lib_handle, "secure_infer_aicpu_key_agreement_do"));
+    if (!launch) return false;
+    unsigned char secret[32] = {}, shared[32] = {}, derived[16] = {}, salt[4] = {};
+    unsigned char host_public[32] = {}, device_public[32] = {}, challenge[32] = {};
+    unsigned char proof[32] = {}, expected[32] = {};
+    static const unsigned char info[] = "SecureInfer X25519 BLAKE2b test v1";
+    aclrtStream setup = nullptr;
+    void *d_public = nullptr, *d_challenge = nullptr, *d_key = nullptr;
+    void *d_device_public = nullptr, *d_proof = nullptr, *d_status = nullptr, *d_iv = nullptr;
+    int32_t status = -1;
+    bool ok = false;
+    crypto_blake2b_ctx ctx;
+    if (RAND_bytes(secret, sizeof(secret)) != 1 || RAND_bytes(challenge, sizeof(challenge)) != 1)
+        goto done;
+    crypto_x25519_public_key(host_public, secret);
+    if (real_aclrtCreateStream(&setup) != ACL_SUCCESS || !setup ||
+        real_aclrtMalloc(&d_public, 32) != ACL_SUCCESS ||
+        real_aclrtMalloc(&d_challenge, 32) != ACL_SUCCESS ||
+        real_aclrtMalloc(&d_key, 32) != ACL_SUCCESS ||
+        real_aclrtMalloc(&d_device_public, 32) != ACL_SUCCESS ||
+        real_aclrtMalloc(&d_proof, 32) != ACL_SUCCESS ||
+        real_aclrtMalloc(&d_status, 4) != ACL_SUCCESS ||
+        real_aclrtMalloc(&d_iv, 32) != ACL_SUCCESS) goto done;
+    if (real_aclrtMemcpyAsync(d_public, 32, host_public, 32, ACL_MEMCPY_HOST_TO_DEVICE, setup) != ACL_SUCCESS ||
+        real_aclrtMemcpyAsync(d_challenge, 32, challenge, 32, ACL_MEMCPY_HOST_TO_DEVICE, setup) != ACL_SUCCESS ||
+        real_aclrtMemcpyAsync(d_status, 4, &status, 4, ACL_MEMCPY_HOST_TO_DEVICE, setup) != ACL_SUCCESS ||
+        launch(setup, d_public, d_challenge, d_key, d_device_public, d_proof, d_status) != 0 ||
+        real_aclrtMemcpyAsync(device_public, 32, d_device_public, 32, ACL_MEMCPY_DEVICE_TO_HOST, setup) != ACL_SUCCESS ||
+        real_aclrtMemcpyAsync(proof, 32, d_proof, 32, ACL_MEMCPY_DEVICE_TO_HOST, setup) != ACL_SUCCESS ||
+        real_aclrtMemcpyAsync(&status, 4, d_status, 4, ACL_MEMCPY_DEVICE_TO_HOST, setup) != ACL_SUCCESS ||
+        real_aclrtSynchronizeStream(setup) != ACL_SUCCESS || status != 0) goto done;
+    crypto_x25519(shared, secret, device_public);
+    { unsigned nonzero = 0; for (auto byte : shared) nonzero |= byte; if (!nonzero) goto done; }
+    crypto_blake2b_keyed_init(&ctx, sizeof(derived), shared, sizeof(shared));
+    crypto_blake2b_update(&ctx, info, sizeof(info) - 1);
+    crypto_blake2b_update(&ctx, host_public, sizeof(host_public));
+    crypto_blake2b_update(&ctx, device_public, sizeof(device_public));
+    crypto_blake2b_update(&ctx, challenge, sizeof(challenge));
+    crypto_blake2b_final(&ctx, derived);
+    crypto_blake2b_keyed(expected, sizeof(expected), derived, sizeof(derived), challenge, sizeof(challenge));
+    static const unsigned char salt_info[] = "SecureInfer IV salt v1";
+    crypto_blake2b_keyed(salt, sizeof(salt), shared, sizeof(shared), salt_info, sizeof(salt_info) - 1);
+    memcpy(metadata.init_iv, salt, sizeof(salt));
+    if (crypto_verify32(expected, proof) != 0 ||
+        real_aclrtMemcpyAsync(d_iv, 32, metadata.init_iv, iv_length,
+                              ACL_MEMCPY_HOST_TO_DEVICE, setup) != ACL_SUCCESS ||
+        real_aclrtSynchronizeStream(setup) != ACL_SUCCESS) goto done;
+    memset(metadata.key, 0, key_length);
+    memcpy(metadata.key, derived, sizeof(derived));
+    for (auto& item : m_ctx_dmetadata) {
+        memset(item.second->key, 0, key_length);
+        memcpy(item.second->key, derived, sizeof(derived));
+    }
+    metadata.dev_key = d_key; d_key = nullptr;
+    metadata.dev_iv = d_iv; d_iv = nullptr;
+    ok = true;
+done:
+    if (setup) real_aclrtSynchronizeStream(setup);
+    for (void* p : {d_public, d_challenge, d_key, d_device_public, d_proof, d_status, d_iv})
+        if (p) real_aclrtFree(p);
+    if (setup) aclrtDestroyStream(setup);
+    crypto_wipe(secret, sizeof(secret));
+    crypto_wipe(shared, sizeof(shared));
+    crypto_wipe(derived, sizeof(derived));
+    crypto_wipe(salt, sizeof(salt));
+    if (ok) fprintf(stderr, "[SecureInfer EXPERIMENT] device key agreement complete\n");
+    return ok;
+}
+
 bool secure_infer_prepare_gcm_backend(encrypt_metadata& metadata,
                                  aclrtStream stream)
 {
@@ -463,9 +542,7 @@ bool secure_infer_prepare_gcm_backend(encrypt_metadata& metadata,
     }
     fprintf(stderr, "[SecureInfer] GCM backend cold start: init stream ready\n");
 
-    unsigned char zero[16] = {0};
-    unsigned char h[16];
-    if (!secure_infer_aes128_block(metadata.key, zero, h)) {
+    if (!metadata.dev_key || !g_launch_aicpu_keystream) {
         aclrtDestroyStream(init_stream);
         return false;
     }
@@ -475,14 +552,14 @@ bool secure_infer_prepare_gcm_backend(encrypt_metadata& metadata,
         aclrtDestroyStream(init_stream);
         return false;
     }
-    if (real_aclrtMemcpyAsync(dev_ghash_h, 32, h, 16,
-                              ACL_MEMCPY_HOST_TO_DEVICE, init_stream) != ACL_SUCCESS ||
+    if (g_launch_aicpu_keystream(init_stream, metadata.dev_key, dev_ghash_h, 16,
+                                 0, 0, 0, 0) != 0 ||
         real_aclrtSynchronizeStream(init_stream) != ACL_SUCCESS) {
         real_aclrtFree(dev_ghash_h);
         aclrtDestroyStream(init_stream);
         return false;
     }
-    fprintf(stderr, "[SecureInfer] GCM backend cold start: H uploaded\n");
+    fprintf(stderr, "[SecureInfer EXPERIMENT] GCM H generated on device\n");
 
     // Start the custom AICPU executor while the model worker is still in its
     // initialization path.  Deferring the first AICPU task until a 5,040-slice
@@ -1268,7 +1345,7 @@ static int observe_and_schedule_secure_infer_repetitive_locked(
             continue;
         }
         assign_to_workers(nullptr, predicted.first, predicted.second,
-                          false, true, false, false, false, stream, ticket);
+                          true, false, stream, ticket);
         if (cpu_submissions != nullptr && secure_infer_gcm_enabled() &&
             secure_infer_gcm_cpu_cipher_prefetch_enabled()) {
             cpu_submissions->emplace_back(
@@ -1551,8 +1628,8 @@ static int observe_and_schedule_periodic_prefetches_locked(
         if (!host_address_in_registered_range(predicted, count)) break;
         uint64_t ticket = 0;
         if (!mark_transfer_prefetch_locked(predicted, count, &ticket)) continue;
-        assign_to_workers(nullptr, predicted, count, false, true, false,
-                          false, false, stream, ticket);
+        assign_to_workers(nullptr, predicted, count, true, false, stream,
+                          ticket);
         if (cpu_submissions != nullptr && secure_infer_gcm_enabled() &&
             secure_infer_gcm_cpu_cipher_prefetch_enabled()) {
             cpu_submissions->emplace_back(
@@ -1625,8 +1702,8 @@ static int schedule_linear_prefetches(const void* current, size_t count, aclrtSt
         if (!mark_transfer_prefetch_locked(predicted, count, &ticket)) {
             continue;
         }
-        assign_to_workers(nullptr, predicted, count, false, true, false,
-                          false, false, stream, ticket);
+        assign_to_workers(nullptr, predicted, count, true, false, stream,
+                          ticket);
         if (stride > UINTPTR_MAX - next) break;
         predictor.linear_prefetch_until = reinterpret_cast<const void*>(next + stride);
         scheduled_until = reinterpret_cast<uintptr_t>(predictor.linear_prefetch_until);
@@ -2269,8 +2346,6 @@ struct d2h_host_decrypt_task {
     unsigned char aad[gcm_aad_length] = {};
     bool aad_valid = false;
     const unsigned char* auth_tag = nullptr;
-    void* ghash_tag_out = nullptr;
-    void* ghash_tag_mask = nullptr;
     uint64_t submit_start_us = 0;
     uint64_t copy_enqueue_us = 0;
     uint64_t kernel_enqueue_us = 0;
@@ -2928,20 +3003,7 @@ static uint32_t calc_aes_block_dim(size_t bytes) {
 static bool ensure_h2d_device_crypto(encrypt_metadata& meta, aclrtStream stream)
 {
     if (!secure_infer_gcm_enabled() && !g_launch_inline_iv_kernel) load_aes_library();
-    if (meta.dev_key == nullptr || meta.dev_iv == nullptr) {
-        if (real_aclrtMalloc(&meta.dev_key, 32) != ACL_SUCCESS) return false;
-        // The AscendC kernel performs one aligned 32-byte GM load for IV.
-        if (real_aclrtMalloc(&meta.dev_iv, 32) != ACL_SUCCESS) return false;
-        if (real_aclrtMemcpyAsync(meta.dev_key, 32, meta.key, 32,
-                                  ACL_MEMCPY_HOST_TO_DEVICE, stream) !=
-                ACL_SUCCESS ||
-            real_aclrtMemcpyAsync(meta.dev_iv, 16, meta.init_iv, 16,
-                                  ACL_MEMCPY_HOST_TO_DEVICE, stream) !=
-                ACL_SUCCESS) {
-            return false;
-        }
-        fprintf(stderr, "[SecureInfer] ✅ H2D serial fallback 初始化 NPU Key/IV\n");
-    }
+    if (meta.dev_key == nullptr || meta.dev_iv == nullptr) return false;
     g_dev_key = meta.dev_key;
     g_dev_iv = meta.dev_iv;
     if ((!secure_infer_gcm_enabled() && g_launch_inline_iv_kernel == nullptr) ||
@@ -3474,17 +3536,36 @@ bool secure_infer_gcm_schedule_cpu_ciphertext(const void* src, size_t bytes,
         secure_infer_build_gcm_aad(src, bytes, PIPE_GCM_DIRECTION_H2D,
                               transfer_ticket, 0, record->aad);
     if (!record->aad_valid) return false;
+    // Reclaim old completed predictions when they fill the bounded pool.
+    // Keep their buffers alive until after releasing the pool mutex; running
+    // workers and DMA-owned ciphertext retain their existing ownership.
+    std::vector<std::shared_ptr<gcm_cpu_cipher_record>> evicted;
     {
         std::lock_guard<std::mutex> lock(g_gcm_cpu_cipher_lock);
         if (g_gcm_cpu_cipher_records.find(transfer_ticket) !=
             g_gcm_cpu_cipher_records.end()) {
             return true;
         }
-        if (g_gcm_cpu_cipher_records.size() >= gcm_cpu_cipher_record_limit() ||
-            bytes > gcm_cpu_cipher_byte_limit() ||
-            g_gcm_cpu_cipher_reserved_bytes >
-                gcm_cpu_cipher_byte_limit() - bytes) {
-            return false;
+        if (bytes > gcm_cpu_cipher_byte_limit()) return false;
+        while (g_gcm_cpu_cipher_records.size() >= gcm_cpu_cipher_record_limit() ||
+               g_gcm_cpu_cipher_reserved_bytes > gcm_cpu_cipher_byte_limit() - bytes) {
+            auto victim = g_gcm_cpu_cipher_records.end();
+            for (auto it = g_gcm_cpu_cipher_records.begin();
+                 it != g_gcm_cpu_cipher_records.end(); ++it) {
+                const auto& candidate = it->second;
+                if (candidate->handed_off ||
+                    candidate->state.load(std::memory_order_acquire) !=
+                        gcm_cpu_cipher_state::ready) {
+                    continue;
+                }
+                if (victim == g_gcm_cpu_cipher_records.end() || it->first < victim->first) {
+                    victim = it;
+                }
+            }
+            if (victim == g_gcm_cpu_cipher_records.end()) return false;
+            g_gcm_cpu_cipher_reserved_bytes -= victim->second->bytes;
+            evicted.push_back(std::move(victim->second));
+            g_gcm_cpu_cipher_records.erase(victim);
         }
         g_gcm_cpu_cipher_reserved_bytes += bytes;
         g_gcm_cpu_cipher_records.emplace(transfer_ticket, record);
@@ -5302,6 +5383,10 @@ static std::unordered_map<void*, std::unique_ptr<h2d_gcm_stream_pipeline>>
 static std::mutex g_h2d_gcm_pipelines_lock;
 
 struct pending_h2d_gcm_batch_task {
+    const void* source = nullptr;
+    size_t destination_capacity = 0;
+    uint32_t layer = 0;
+    uint32_t tensor = 0;
     aclrtStream stream = nullptr;
     h2d_gcm_pipeline_slot* slot = nullptr;
     void* ciphertext = nullptr;
@@ -5420,24 +5505,12 @@ static bool gcm_profile_trust_tag_enabled()
 // final KV address directly; an invalid tag writes only zeros.  The layer or
 // request completion event is still recorded after the kernel, preserving
 // verify-before-use while removing one full-size temporary-output D2D copy.
-// Keep an explicit switch for paired evaluation and compatibility fallback.
 static bool gcm_direct_verified_release_enabled()
 {
     static int enabled = -1;
     if (enabled < 0) {
         const char* env = std::getenv("PIPE_GCM_DIRECT_VERIFIED_RELEASE");
-        if (env != nullptr) {
-            enabled = std::atoi(env) != 0 ? 1 : 0;
-        } else {
-            // In the verified-layer pipeline the fused kernel already gates
-            // visibility on a successful tag comparison.  Direct placement
-            // therefore removes only a redundant temporary-output D2D copy;
-            // it neither weakens verify-before-use nor changes the legacy
-            // request-atomic path.
-            const char* layerwise = std::getenv("PIPE_GCM_H2D_LAYERWISE");
-            enabled = (layerwise != nullptr && std::atoi(layerwise) != 0)
-                ? 1 : 0;
-        }
+        enabled = (env != nullptr && std::atoi(env) != 0) ? 1 : 0;
         fprintf(stderr, "[SecureInfer] direct verified GCM KV placement: %s\n",
                 enabled ? "enabled" : "disabled");
     }
@@ -5730,6 +5803,13 @@ static bool flush_h2d_gcm_batch_tasks()
 
     for (auto& task : pending) {
         auto& slot = *task.slot;
+        if (authentication_observer_enabled()) {
+            const auto record = observe_recovery_authentication(
+                task.status_output, task.stream, task.layer, task.tensor,
+                task.plaintext_output, task.destination_capacity,
+                task.source, task.count, task.stream);
+            slot.authentication_observed = record->observed;
+        }
         slot.profile_pending = true;
         slot.profile_precise = false;
         slot.profile_total_start_us = task.total_start_us;
@@ -6598,6 +6678,10 @@ static aclError inline_h2d_encrypt_commit(void* dst,
         }
         if (batch_release) {
             pending_h2d_gcm_batch_task task;
+            task.source = src;
+            task.destination_capacity = destMax;
+            task.layer = secure_infer_gcm_aad_u32(gcm_aad, 8);
+            task.tensor = static_cast<uint32_t>(gcm_aad[6]);
             task.stream = stream;
             task.slot = gcm_pipeline_slot;
             task.ciphertext = h2d_temp_in;
@@ -7343,6 +7427,13 @@ static inline void init_encrypt_ctx(aclrtMemcpyKind kind, aclrtStream stream)
         // 内部使用全局变量控制worker初始化
         bool global_enable_encrypt = (enable_h2d_encrypt || enable_d2h_encrypt);
 
+        if (global_enable_encrypt && secure_infer_gcm_enabled() &&
+            (m_ctx_metadata.empty() ||
+             !secure_infer_experimental_device_session(*m_ctx_metadata.begin()->second))) {
+            fprintf(stderr, "[SecureInfer EXPERIMENT] device key agreement failed\n");
+            std::abort();
+        }
+
         fprintf(stderr, "[SecureInfer Debug] enable_h2d_encrypt=%d, enable_d2h_encrypt=%d, global_enable=%d\n",
                 enable_h2d_encrypt, enable_d2h_encrypt, global_enable_encrypt);
 
@@ -7451,10 +7542,7 @@ static inline void init_encrypt_ctx(aclrtMemcpyKind kind, aclrtStream stream)
  */
 
 void assign_to_workers(void *dst, const void *src, size_t count,
-                       bool decrypt = false, bool predict = true,
-                       bool commit = false, bool update_predict_iv = false,
-                       bool batch_commit = false,
-                       aclrtStream user_stream = nullptr,
+                       bool predict, bool commit, aclrtStream user_stream,
                        uint64_t transfer_ticket,
                        uint64_t transfer_block_offset,
                        uint64_t prefetch_group_id)
@@ -7515,7 +7603,6 @@ void assign_to_workers(void *dst, const void *src, size_t count,
             task.enc_task.transfer_block_offset = transfer_block_offset;
             task.dst = dst_char;
             task.using_predict = commit;
-            task.update_predict_iv = update_predict_iv;
             task.profile_start_us = secure_infer_now_us();
 
             if (commit && user_stream != nullptr) {
@@ -7589,7 +7676,6 @@ void sync_predictor()
                 task0.enc_task.generation = predictor.generation;
                 task0.dst = task.second.first;
                 task0.using_predict = true;
-                task0.update_predict_iv = false;
                 task0.profile_start_us = secure_infer_now_us();
                 encrypt_worker_entrys[0]->commit_tasks.push_back(task0);
             }
@@ -7623,14 +7709,17 @@ aclrtContext g_main_ctx = nullptr;
 HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax, const void *src, size_t count,
                                                        aclrtMemcpyKind kind, aclrtStream stream)
 {
-    if (g_main_ctx == nullptr) {
-        aclrtGetCurrentContext(&g_main_ctx);
-        if (g_main_ctx != nullptr) {
-            fprintf(stderr, "[SecureInfer] ✅ 捕获主线程 Context: %p\n", g_main_ctx);
-        }
+    // Initialize only for registered KV transfers, after the framework has
+    // established its rank's device context and communication resources.
+    const bool kv_transfer = count > 0 &&
+        ((kind == ACL_MEMCPY_HOST_TO_DEVICE && src != nullptr &&
+          host_prediction_in_same_range(src, src, count)) ||
+         (kind == ACL_MEMCPY_DEVICE_TO_HOST && dst != nullptr &&
+          host_prediction_in_same_range(dst, dst, count)));
+    if (kv_transfer) {
+        if (g_main_ctx == nullptr) aclrtGetCurrentContext(&g_main_ctx);
+        init_encrypt_ctx(kind, stream);
     }
-    // 1. 初始化加密上下文
-    init_encrypt_ctx(kind, stream);
     // 2. 基础参数检查
     if (count == 0) return ACL_SUCCESS;
     if (dst == nullptr || src == nullptr) {
@@ -7772,8 +7861,7 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
                         "[SecureInfer] transfer层预测命中: src=%p, size=%zu\n",
                         src, count);
             }
-            assign_to_workers(dst, src, count, false, false, true, false,
-                              false, stream, demand_ticket,
+            assign_to_workers(dst, src, count, false, true, stream, demand_ticket,
                               demand_block_offset,
                               demand_prefetch_group_id);
             if (secure_infer_linear_fast_fallback_enabled() &&
@@ -7873,7 +7961,7 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
                 if (sampled_predict_log(hit_log_count, 16, 4096)) {
                     fprintf(stderr, "[SecureInfer] 线性预测命中: 当前=%p → 下一个=%p\n", src, predicted_next);
                 }
-                assign_to_workers(dst, src, count, false, false, true, false, false, stream);
+                assign_to_workers(dst, src, count, false, true, stream);
                 schedule_linear_prefetches(src, count, stream);
             } else {
                 static std::atomic<uint64_t> boundary_log_count{0};
@@ -7893,7 +7981,7 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
                 predictor.linear_count = 0;
                 predictor.read_only_swap_record.clear();
                 predictor.read_only_swap_record.push_back(std::make_pair(src, count));
-                assign_to_workers(dst, src, count, false, false, true, false, false, stream);
+                assign_to_workers(dst, src, count, false, true, stream);
             }
             goto POST_PROCESS;
         }
@@ -7981,14 +8069,7 @@ HOOK_C_API HOOK_DECL_EXPORT aclError aclrtMemcpyAsync(void *dst, size_t destMax,
         }
 
         auto &meta = *m_ctx_metadata.begin()->second;
-        if (meta.dev_key == nullptr) {
-            real_aclrtMalloc(&meta.dev_key, 32);
-            // CTR.cpp reads an aligned 32-byte IV record.
-            real_aclrtMalloc(&meta.dev_iv, 32);
-            real_aclrtMemcpyAsync(meta.dev_key, 32, meta.key, 32, ACL_MEMCPY_HOST_TO_DEVICE, stream);
-            real_aclrtMemcpyAsync(meta.dev_iv, 16, meta.init_iv, 16, ACL_MEMCPY_HOST_TO_DEVICE, stream);
-            fprintf(stderr, "[SecureInfer] ✅ NPU Key/IV 内存初始化完成\n");
-        }
+        if (meta.dev_key == nullptr || meta.dev_iv == nullptr) std::abort();
         g_dev_key = meta.dev_key;
         g_dev_iv = meta.dev_iv;
 

@@ -5,7 +5,6 @@
 
  #include "secure_infer.h"
  #include "hack.h"
- #include "resource_monitor.h"
  #include <unistd.h>
  #include <cstring>
  #include <cassert>
@@ -877,11 +876,6 @@ size_t process_garbage_collection(std::deque<GCBatch>& gc_queue) {
      fprintf(stderr, "[encrypt_worker] ✅ 密钥和IV复制完成\n");
      fflush(stderr);
 
-     // 分配假数据缓冲区
-     auto fake_src = new unsigned char [1 << 20];
-     fprintf(stderr, "[encrypt_worker] ✅ 假数据缓冲区分配完成\n");
-     fflush(stderr);
-
      // 🎯 [关键修复] 设置初始化完成标志
      x->enc_init_done.store(true, std::memory_order_release);
      fprintf(stderr, "[encrypt_worker] ✅ 初始化标记设置完成，进入主循环\n");
@@ -1014,7 +1008,6 @@ size_t process_garbage_collection(std::deque<GCBatch>& gc_queue) {
 
      // 清理资源
      real_EVP_CIPHER_CTX_free(local_ctx);
-     delete[] fake_src;
  }
 
 
@@ -2266,7 +2259,7 @@ size_t process_garbage_collection(std::deque<GCBatch>& gc_queue) {
      aclrtContext acl_ctx;    // <-- [新添加]
      aclrtStream stream;      // <-- [新添加]
 
-     void *fake_src, *fake_dst; // fake_src 在您的代码中未被使用
+     void *fake_dst;
 
      // [修改] 替换 CUDA Driver API 为 ACL Runtime API (直接调用)
     //  assert(aclInit(nullptr) == ACL_SUCCESS);

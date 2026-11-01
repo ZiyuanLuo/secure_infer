@@ -82,15 +82,6 @@
      return func_entry(dst, destMax, src, count, kind);
  }
 
- // 替换 real_cudaGetLastError
- static inline aclError real_aclrtGetLastError(aclrtLastErrLevel level)
- {
-     using func_ptr = aclError (*)(aclrtLastErrLevel);
-     static auto func_entry = reinterpret_cast<func_ptr>(get_symbol_acl("aclrtGetLastError"));
-     if (!func_entry) return ACL_ERROR_LD_SO_NOT_LOADED;
-     return func_entry(level);
- }
-
  // 替换 real_cudaDeviceSynchronize
  static inline aclError real_aclrtSynchronizeDevice(void)
  {
@@ -123,15 +114,6 @@
      return func_entry(stream, fn, args);
  }
 
- // 替换 real_cudaStreamQuery
- static inline aclError real_aclrtQueryStream(aclrtStream stream)
- {
-     using func_ptr = aclError (*)(aclrtStream);
-     static auto func_entry = reinterpret_cast<func_ptr>(get_symbol_acl("aclrtQueryStream"));
-     if (!func_entry) return ACL_ERROR_LD_SO_NOT_LOADED;
-     return func_entry(stream);
- }
-
  // 替换 real_cudaGetDeviceCount
  static inline aclError real_aclrtGetDeviceCount(int32_t *count)
  {
@@ -139,15 +121,6 @@
      static auto func_entry = reinterpret_cast<func_ptr>(get_symbol_acl("aclrtGetDeviceCount"));
      if (!func_entry) return ACL_ERROR_LD_SO_NOT_LOADED;
      return func_entry(count);
- }
-
- // 替换 real_cudaSetDevice
- static inline aclError real_aclrtSetDevice(int32_t deviceId)
- {
-     using func_ptr = aclError (*)(int32_t);
-     static auto func_entry = reinterpret_cast<func_ptr>(get_symbol_acl("aclrtSetDevice"));
-     if (!func_entry) return ACL_ERROR_LD_SO_NOT_LOADED;
-     return func_entry(deviceId);
  }
 
  // [!!! 新增钩子 (worker.cpp 所需) !!!]
@@ -270,15 +243,6 @@ static inline aclError real_aclrtGetDeviceUtilizationRate(int32_t deviceId, aclr
     static auto func_entry = reinterpret_cast<func_ptr>(get_symbol_acl("aclrtGetDeviceUtilizationRate"));
     if (!func_entry) return ACL_ERROR_LD_SO_NOT_LOADED;
     return func_entry(deviceId, utilizationInfo);
-}
-
-// [新增] aclrtGetDeviceResLimit
-static inline aclError real_aclrtGetDeviceResLimit(int32_t deviceId, aclrtDevResLimitType type, uint32_t *value)
-{
-    using func_ptr = aclError (*)(int32_t, aclrtDevResLimitType, uint32_t *);
-    static auto func_entry = reinterpret_cast<func_ptr>(get_symbol_acl("aclrtGetDeviceResLimit"));
-    if (!func_entry) return ACL_ERROR_LD_SO_NOT_LOADED;
-    return func_entry(deviceId, type, value);
 }
 
 // [新增] aclrtGetDevice — 获取当前绑定的 device ID
