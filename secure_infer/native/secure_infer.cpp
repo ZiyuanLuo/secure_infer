@@ -1488,7 +1488,19 @@ static int observe_and_schedule_periodic_prefetches_locked(
     const void* current, size_t count, aclrtStream stream,
     std::vector<periodic_cpu_submission>* cpu_submissions = nullptr)
 {
-    constexpr size_t kMaxPeriod = 128;
+    // Longest repeat period, in observed copies, that the history learner searches.  A layer's reload is
+    // one K and one V copy per block per rank, so the period equals twice the blocks of a layer; a cap of 128
+    // stopped the learner above 64 blocks (8192 tokens at 128-token blocks), where every layer then paid
+    // synchronous fallbacks.  The search below skips periods that cannot contain a boundary, so a large cap
+    // costs little.
+    static const size_t kMaxPeriod = [] {
+        const char* env = std::getenv("PIPE_PERIODIC_MAX_PERIOD");
+        long value = env != nullptr ? std::atol(env) : 1024;
+        if (value < 2) value = 2;
+        if (value > 4096) value = 4096;
+        fprintf(stderr, "[SecureInfer] periodic history learner: max period %ld copies\n", value);
+        return static_cast<size_t>(value);
+    }();
     const uintptr_t current_addr = reinterpret_cast<uintptr_t>(current);
 
     if (predictor.periodic_last_src == nullptr ||
@@ -1539,7 +1551,15 @@ static int observe_and_schedule_periodic_prefetches_locked(
     if (predictor.periodic_cycle.empty()) {
         const size_t n = predictor.periodic_deltas.size();
         const size_t upper = std::min(kMaxPeriod, n / 2);
-        for (size_t period = 2; period <= upper; ++period) {
+        // A cycle must contain a boundary (a delta other than the copy size) in its last period, so periods
+        // shorter than the distance back to the latest boundary can never match.  Skipping them is exact.
+        size_t first_period = 2;
+        {
+            size_t k = n;
+            while (k > 0 && predictor.periodic_deltas[k - 1] == static_cast<intptr_t>(count)) --k;
+            first_period = k == 0 ? upper + 1 : std::max<size_t>(2, n - (k - 1));
+        }
+        for (size_t period = first_period; period <= upper; ++period) {
             bool equal = true;
             bool has_boundary = false;
             for (size_t offset = 0; offset < period; ++offset) {

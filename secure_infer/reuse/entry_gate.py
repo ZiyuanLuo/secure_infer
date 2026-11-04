@@ -23,6 +23,13 @@ def root():
     return Path(os.environ['RUNTIME_RESULT_DIR'])
 
 
+def _blocked_ms(row, step):
+    # Layer-wait time recorded inside one compute step.
+    return sum(g['stream_span_ms'] for g in row['gates']
+               if step['start_ms'] <= g['start_ms'] and
+               g['end_ms'] <= step['end_ms'])
+
+
 def update():
     path = root()/'device_timeline.jsonl'
     if not path.exists():
@@ -45,22 +52,29 @@ def update():
             # The slowest TP rank determines completion, rather than the
             # sum or average of rank-local observations.
             row = dict(max(peers, key=lambda r:
-                sum(x['stream_span_ms'] for x in r['steps']) -
-                sum(x['stream_span_ms'] for x in r['gates'])))
+                sum(x['stream_span_ms'] for x in r['steps'])))
             row['loads'] = max(peers, key=lambda r:
                 sum(x['stream_span_ms'] for x in r['loads']))['loads']
+            # Layer waits are recorded by the rank whose host callback met them,
+            # which differs between requests, while collectives tie the step
+            # spans of all ranks together.  Subtracting only the waits of the
+            # slowest-looking rank leaves the wait inside the compute sample
+            # whenever another rank observed it, so each step is charged the
+            # longest wait any rank recorded for it.
+            if all(len(p['steps']) == len(row['steps']) for p in peers):
+                row['blocked_ms'] = [
+                    max(_blocked_ms(p, p['steps'][i]) for p in peers)
+                    for i in range(len(row['steps']))]
         # flush() emits this trace only after every marker and the complete
         # prefill have physically finished. Only completed own observations train.
-        for step in row['steps']:
+        for index, step in enumerate(row['steps']):
             # A standalone short tail exposes input/launch startup differently
             # from a chunk in a continuous prefill. Keep full-pass observations
             # and all steps from multi-chunk requests in the calibration window.
             if len(row['steps']) == 1 and step['tokens'] < int(os.environ.get('RUNTIME_COMPUTE_CHUNK','1024')):
                 continue
-            gates = [g for g in row['gates']
-                     if step['start_ms'] <= g['start_ms'] and
-                     g['end_ms'] <= step['end_ms']]
-            blocked = sum(g['stream_span_ms'] for g in gates)
+            blocked = (row['blocked_ms'][index] if 'blocked_ms' in row
+                       else _blocked_ms(row, step))
             duration = max(0., step['stream_span_ms']-blocked)
             if duration > 0:
                 sample = dict(request_id=rid, tokens=step['tokens'],
