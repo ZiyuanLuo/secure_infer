@@ -36,40 +36,50 @@ class RuntimeStorageScheduler(NativeScheduler):
         if CHUNK % 128 or FETCH % 128 or CHUNK<=0 or FETCH<=0:
             raise ValueError('RUNTIME compute/load chunks must be positive multiples of 128')
         self.entry_layers=spec.vllm_config.model_config.hf_config.num_hidden_layers
-        self.reuse_requests={}; self.kickoff={}
+        self.reuse_requests={}; self.kickoff={}; self.preempted_loads=set()
         self.scale_scheduler_config=config
         self.ordinary_prefill_threshold=config.long_prefill_token_threshold
 
     def get_num_new_matched_tokens(self,request,num_computed_tokens):
+        if request.request_id in self.preempted_loads:
+            # Its earlier load may still be in flight; recompute instead of
+            # starting a second load into newly allocated blocks.
+            return 0,False
         tokens,_=super().get_num_new_matched_tokens(request,num_computed_tokens)
-        # Partial device hits retain the native path; q applies to a host prefix.
-        if num_computed_tokens or not tokens:
+        if not tokens:
             return tokens,False
-        decision=entry_gate.choose(tokens,request.num_prompt_tokens-tokens,CHUNK,self.entry_layers)
+        # A device-resident head of num_computed_tokens stays in place; the
+        # split applies to the host-resident tokens that follow it.
+        base=num_computed_tokens
+        suffix=request.num_prompt_tokens-base-tokens
+        decision=entry_gate.choose(tokens,suffix,CHUNK,self.entry_layers,base)
         trace('entry_cost_decision',request_id=request.request_id,N=tokens,
-              U=request.num_prompt_tokens-tokens,**decision)
+              U=suffix,D=base,**decision)
         if decision['policy']=='load':return tokens,False
         if decision['policy']=='compute':return 0,False
         q=decision['q']
         limit=self.scale_scheduler_config.long_prefill_token_threshold
         self.scale_scheduler_config.long_prefill_token_threshold=min(CHUNK,q,limit) if limit>0 else min(CHUNK,q)
-        self.reuse_requests[request.request_id]=dict(R=tokens,q=q,suffix_started=False)
+        # R and q are absolute positions: recompute [base, base+q), reload [base+q, base+tokens).
+        self.reuse_requests[request.request_id]=dict(R=base+tokens,q=base+q,D=base,suffix_started=False)
         return 0,False
 
     def update_state_after_alloc(self,request,blocks,num_external_tokens):
         super().update_state_after_alloc(request,blocks,num_external_tokens)
         state=self.reuse_requests.get(request.request_id)
         if state is None:return
-        ids=blocks.get_block_ids()[0]; prefix=state['R']
-        assert prefix%self.offloaded_block_size==0
-        hashes=list(self._get_block_hashes(request,end_idx=prefix//self.offloaded_block_size))
+        ids=blocks.get_block_ids()[0]; prefix=state['R']; head=state['D']//self.offloaded_block_size
+        assert prefix%self.offloaded_block_size==0 and state['D']%self.offloaded_block_size==0
+        hashes=list(self._get_block_hashes(request,start_idx=head,end_idx=prefix//self.offloaded_block_size))
         source=self.manager.prepare_load(hashes)
         self._reqs_being_loaded[request.request_id].update(hashes)
         if self._blocks_being_loaded is not None:self._blocks_being_loaded.update(hashes)
         self._next_stored_block_idx[request.request_id]=prefix//self.offloaded_block_size
         assert len(ids)>=prefix//self.gpu_block_size
         self.kickoff[request.request_id]=dict(R=prefix,q=state['q'],
-            source=list(source.block_ids),destination=list(ids[:prefix//self.gpu_block_size]))
+            # Source is indexed by absolute block position; the device-resident
+            # head has no host source and is never read (reloads start at q >= D).
+            source=[-1]*head+list(source.block_ids),destination=list(ids[:prefix//self.gpu_block_size]))
 
     def build_connector_meta(self,output):
         base=super().build_connector_meta(output); controls={}
@@ -88,6 +98,7 @@ class RuntimeStorageScheduler(NativeScheduler):
     def request_finished(self,request,block_ids):
         result=super().request_finished(request,block_ids)
         self.reuse_requests.pop(request.request_id,None)
+        self.preempted_loads.discard(request.request_id)
         return result
 
 class RuntimeScheduler(Scheduler):
@@ -95,10 +106,26 @@ class RuntimeScheduler(Scheduler):
         super().__init__(*args,**kwargs)
         self.ordinary_prefill_threshold=self.scheduler_config.long_prefill_token_threshold
 
+    def _preempt_request(self,request,timestamp):
+        # vLLM frees a preempted request's blocks without telling the reload
+        # thread; a load still in flight must not be repeated into new blocks.
+        cs=self.connector.connector_scheduler if self.connector else None
+        if isinstance(cs,RuntimeStorageScheduler) and getattr(cs,"_reqs_being_loaded",{}).get(request.request_id):
+            trace('loading_request_preempted',request_id=request.request_id,
+                  num_computed=request.num_computed_tokens,
+                  reuse=cs.reuse_requests.get(request.request_id))
+            cs.preempted_loads.add(request.request_id)
+            cs.reuse_requests.pop(request.request_id,None)
+        return super()._preempt_request(request,timestamp)
+
     def schedule(self):
         cs=self.connector.connector_scheduler if self.connector else None
         self.scheduler_config.long_prefill_token_threshold=self.ordinary_prefill_threshold
         if isinstance(cs,RuntimeStorageScheduler):
+            # vLLM preempts from the end of the running list; keep requests
+            # with an in-flight host load at the front (stable order otherwise).
+            if isinstance(self.running,list):
+                self.running.sort(key=lambda r:not getattr(cs,"_reqs_being_loaded",{}).get(r.request_id))
             for request in self.running:
                 state=cs.reuse_requests.get(request.request_id)
                 if not state or state['suffix_started']:continue
@@ -115,8 +142,14 @@ class RuntimeScheduler(Scheduler):
         allocate=self.kv_cache_manager.allocate_slots
         def allocate_for_tail(request,num_new_tokens,*args,**kwargs):
             state=cs.reuse_requests.get(request.request_id) if isinstance(cs,RuntimeStorageScheduler) else None
-            if state:
-                needed=max(0,state['R']-request.num_computed_tokens-num_new_tokens)
+            # A request whose host load is in flight reserves blocks for its whole
+            # prompt up front, so it never allocates (and triggers preemption of
+            # itself) while the load still writes into its blocks.
+            if state or getattr(cs,"_reqs_being_loaded",{}).get(request.request_id):
+                total=getattr(request,"num_prompt_tokens",None)
+                if total is None:
+                    total=state['R'] if state else request.num_computed_tokens
+                needed=max(0,total-request.num_computed_tokens-num_new_tokens)
                 kwargs['num_lookahead_tokens']=max(kwargs.get('num_lookahead_tokens',0),needed)
             return allocate(request,num_new_tokens,*args,**kwargs)
         self.kv_cache_manager.allocate_slots=allocate_for_tail

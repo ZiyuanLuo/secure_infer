@@ -141,14 +141,18 @@ def compute_ms(model, n, context=0):
     return (model.get('step_ms',0.) if n>0 else 0.)+model['a']*n/1024 + model['b']*(n/1024)*(context+n/2)/1024
 
 
-def head_ms(model, n, chunk):
+def head_ms(model, n, chunk, base=0):
+    # Recomputing n tokens that start at context position base.
     values = np.asarray(n, dtype=float)
     result = (model.get('step_ms', 0.) * np.ceil(values / chunk) +
               model['a'] * values / 1024 +
-              model['b'] * (values / 1024) ** 2 / 2)
+              model['b'] * (values / 1024) ** 2 / 2 +
+              model['b'] * (values / 1024) * base / 1024)
     return result.item() if result.ndim == 0 else result
 
-def choose(r, u, chunk, layers):
+def choose(r, u, chunk, layers, base=0):
+    # r host-resident prefix tokens start at position base; the first base
+    # tokens are already in device HBM.
     begin = time.monotonic_ns()
     force_q = os.environ.get('RUNTIME_FORCE_Q', '')
     if force_q != '':
@@ -174,15 +178,15 @@ def choose(r, u, chunk, layers):
                     offline_profile_used=False, model=None,
                     decision_ns=time.monotonic_ns()-begin)
     qs = np.array(sorted(set(range(0,r,128)) | {r}), dtype=np.int64)
-    suffix = compute_ms(model,u,r)
-    head = head_ms(model, qs, chunk)
+    suffix = compute_ms(model,u,base+r)
+    head = head_ms(model, qs, chunk, base)
     ns=r-qs
     service = load_ms(model, ns)
     # Load observations include their setup cost. Equal layer service/compute
     # remains an approximation; the complete-recompute endpoint has no load.
     pipeline = pipeline_finish(suffix,service,layers)
     finish = np.maximum(head+suffix,pipeline)
-    finish[-1] = compute_ms(model,r+u)
+    finish[-1] = compute_ms(model,r+u,base)
     best = int(np.argmin(finish))
     best_q = int(qs[best])
     gain = float(finish[0]-finish[best])

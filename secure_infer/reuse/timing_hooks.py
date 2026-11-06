@@ -49,8 +49,10 @@ def install(worker):
         new_lengths={r.req_id:len(r.prompt_token_ids) for r in scheduler_output.scheduled_new_reqs}
         measured=[rid for rid,n in scheduler_output.num_scheduled_tokens.items()
             if n>0 and positions[rid] < (new_lengths[rid] if rid in new_lengths else self.requests[rid].num_prompt_tokens)]
-        if len(measured)!=1 or len(scheduler_output.num_scheduled_tokens)!=1:
-            # Batched latency is not an individual compute-model observation.
+        if len(measured)!=1:
+            # Two prefills in one step are not an individual compute-model
+            # observation.  Co-scheduled decode tokens are allowed; their small
+            # cost is charged to this step and recorded as co_decode.
             for rid in measured:_traces.pop(rid,None)
             _current=None
             self._paci_timing_step=None
@@ -65,6 +67,7 @@ def install(worker):
         count=scheduler_output.num_scheduled_tokens[rid]
         position=positions[rid]
         self._paci_timing_step=dict(trace=trace,position=position,tokens=count,
+            co_decode=len(scheduler_output.num_scheduled_tokens)-1,
             prompt_tokens=(new_lengths[rid] if rid in new_lengths else self.requests[rid].num_prompt_tokens))
         try:
             result=old_execute(self,scheduler_output,*args,**kwargs)
@@ -82,7 +85,7 @@ def install(worker):
         after=marker()
         step['trace']['steps'].append(dict(start=before,end=after,
             position=step['position'],tokens=step['tokens'],
-            prompt_tokens=step['prompt_tokens'],
+            prompt_tokens=step['prompt_tokens'],co_decode=step['co_decode'],
             host_call_ms=(time.monotonic_ns()-host_start)/1e6,phase='prefill'))
         return result
     NPUModelRunner.execute_model=execute
