@@ -1,168 +1,210 @@
 # secure_infer
 
-面向 Ascend NPU 的 KV cache 卸载与复用运行时，包含 vLLM 服务、逐层加载、预测性加密、异步写回、预填充前的静态切分选择。
+## 项目简介
 
-## 代码结构
+secure_infer 是面向 Ascend NPU 的 LLM 推理运行时，基于 vLLM 和 vLLM-Ascend 实现主机 KV cache 卸载与复用。
 
-~~~text
-.
-├── .env.example          # 本地配置模板
-├── Dockerfile            # 容器环境
-├── Makefile              # 本地库与认证内核构建
-├── start.sh              # 一键构建并在后台启动容器服务
-├── manage.sh             # 状态、日志、停止、测试和请求入口
-├── configure.sh          # 依赖检查与本地编译
-├── run.sh                # 配置推理环境并启动 vLLM
-├── query.sh              # 读取配置并发送请求
-├── request.py            # 精确前后缀构造、预热和流式计时
-├── infer.py              # 独立推理示例
-└── secure_infer/
-    ├── native/           # C++ 传输、密码钩子与认证内核
-    ├── kv_offload/       # 主机缓存、逐层等待与传输生命周期
-    ├── reuse/            # 代价标定和静态切分选择
-    ├── serving/          # vLLM 服务入口
-    └── tests/            # 决策、层间交接和生命周期测试
-~~~
+- **安全传输**：使用 AES-GCM 保护主机与设备之间的 KV 数据，每层在解密、认证和写入完成后执行 attention。
+- **加密预取**：根据 KV 传输地址预测后续传输，提前执行主机加密和设备密钥流生成。
+- **前缀复用**：结合重算、逐层重载与后缀计算的耗时，在 prefill 前选择前缀切分点。
+- **异步写回**：在后台将 KV 写回主机，认证完成后发布缓存条目。
 
-## 一键启动
+主机与设备通过临时 X25519 密钥交换建立会话密钥。设备身份认证依赖外部可信配给，密钥交换本身不验证设备证书。
 
-宿主机使用 Linux、Ascend NPU 驱动和 Docker。执行账号需要 Docker 使用权限。容器提供 CANN、PyTorch、torch-npu、vLLM 和 vllm-ascend，模型由本地权重目录提供。设备、驱动与容器中的 CANN 版本需兼容。
+## 运行指南
 
-~~~bash
+### 1. 环境准备
+
+需要 Linux、Ascend NPU 驱动、本地模型权重，以及相互兼容的 CANN、PyTorch、torch-npu、vLLM 和 vLLM-Ascend。可选择 Docker 部署或在已有推理环境中直接运行。
+
+```bash
+git clone https://github.com/ZiyuanLuo/secure_infer.git
+cd secure_infer
 cp .env.example .env
-vi .env
+```
+
+编辑 `.env`，设置模型路径和设备。以下为单卡配置示例，模型及 KV cache 需要能放入所选设备：
+
+```dotenv
+MODEL_PATH=/path/to/model
+MODEL_NAME=secure-infer
+DEVICE_IDS=0
+TP_SIZE=1
+PP_SIZE=1
+HOST=127.0.0.1
+PORT=8080
+MAX_MODEL_LEN=8192
+MAX_NUM_BATCHED_TOKENS=8192
+MAX_NUM_SEQS=1
+GPU_MEMORY_UTILIZATION=0.85
+NUM_CPU_BLOCKS=128
+COMPUTE_CHUNK=1024
+LOAD_CHUNK=2048
+SERVE_MODE=runtime
+ENABLE_H2D=1
+ENABLE_D2H=1
+```
+
+`NUM_CPU_BLOCKS` 决定主机 KV 池容量，每块保存 128 个 token 在所有层的 KV；内存开销随模型及 TP 分片变化。计算、加载粒度须为 128 的正整数倍。
+
+### 2. Docker 启动
+
+宿主机需安装 Docker，运行账号需有 Docker 使用权限。`.env` 中的 `BASE_IMAGE` 指定 Ascend 推理基础镜像，`IMAGE` 指定本项目镜像名称。
+
+```bash
 ./start.sh
-~~~
+```
 
-在 .env 中设置 MODEL_PATH、DEVICE_IDS、TP_SIZE、上下文长度。也可通过参数指定模型：
+也可以在启动时指定模型目录：
 
-~~~bash
-./start.sh 模型目录
-~~~
+```bash
+./start.sh /path/to/model
+```
 
-脚本按需构建镜像，自动挂载项目、模型和驱动，编译 libsecure_infer.so 和仓库自带的 AES-GCM AICPU 算子，再后台启动。容器名由项目位置和账号生成；容器内使用 root 访问设备；停止时将生成文件的所有权归还调用账号。移动项目或更换账号无需改脚本。
+脚本在本地镜像不存在时构建镜像，挂载项目、模型和驱动，编译传输库及 AICPU AES-GCM 算子，然后在后台启动服务。
 
-~~~bash
-./manage.sh status
-./manage.sh logs
-./manage.sh test
+```bash
+./manage.sh status  # 查看容器状态
+./manage.sh logs    # 查看最近的服务日志
+```
+
+容器运行不等于模型已经就绪。等待模型和主机 KV 池初始化完成，再检查：
+
+```bash
+curl --fail http://127.0.0.1:8080/health
+curl --fail http://127.0.0.1:8080/v1/models
+```
+
+停止并移除容器：
+
+```bash
 ./manage.sh stop
-~~~
+```
 
-status 显示容器状态；模型加载完成以日志中的 Application startup complete 和健康检查为准。stop 停止并移除项目容器，之后可再次执行 start.sh。
+修改 `.env` 后，停止并重新启动，使配置生效。重新构建镜像可执行：
 
-~~~bash
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/v1/models
-~~~
+```bash
+docker build --build-arg BASE_IMAGE=quay.io/ascend/vllm-ascend:v0.14.0rc1 \
+  -t secure-infer:local .
+```
 
-已安装完整 Ascend 推理依赖时，先加载本机 CANN、ATB 环境，再设置 ASCEND_ROOT 并执行 ./configure.sh 和 ./run.sh。
+镜像名称和基础镜像应与 `.env` 中的 `IMAGE`、`BASE_IMAGE` 一致。
 
-## 配置参数
+### 3. 在已有环境中运行
+
+先激活安装了推理依赖的 Python 环境，加载本机 CANN 环境；安装了 ATB 时也加载对应环境：
+
+```bash
+source /path/to/ascend-toolkit/set_env.sh
+source /path/to/nnal/atb/set_env.sh
+```
+
+在 `.env` 中将 `ASCEND_ROOT` 设置为 CANN 安装目录，将 `PYTHON` 设置为该环境的解释器。编译还需 C++17 编译器、Make、CMake 和 OpenSSL 开发库。
+
+```bash
+./configure.sh
+./run.sh
+```
+
+`configure.sh` 检查 Python 依赖，构建 `libsecure_infer.so`，并在 `runtime` 模式下构建 AICPU 认证算子。`run.sh` 加载配置并在前台启动服务，按 `Ctrl+C` 停止。
+
+### 4. 张量并行
+
+单机四卡 TP 示例，在 `.env` 中设置：
+
+```dotenv
+MODEL_PATH=/path/to/large-model
+DEVICE_IDS=0,1,2,3
+TP_SIZE=4
+PP_SIZE=1
+DISTRIBUTED_EXECUTOR_BACKEND=mp
+MAX_NUM_SEQS=1
+```
+
+其余启动步骤相同。每个 rank 处理自己的 KV 分片和密码会话；主机池占用需按所有 rank 合计。
+
+多机原生明文推理的 Ray/PP 部署步骤见 [多机部署指南](deploy/pp4_tp8/README.md)。
+
+### 5. 发送请求
+
+服务提供 OpenAI 兼容的 completions 接口，可直接发送普通文本：
+
+```bash
+curl --fail http://127.0.0.1:8080/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "secure-infer",
+    "prompt": "Explain how a KV cache works.",
+    "max_tokens": 64,
+    "temperature": 0,
+    "stream": false
+  }'
+```
+
+也可以用仓库脚本指定共享前缀和后缀长度。Docker 部署使用：
+
+```bash
+./manage.sh query --prefix-tokens 512 --suffix-tokens 1024 --output-tokens 16
+```
+
+本地部署使用：
+
+```bash
+./query.sh --prefix-tokens 512 --suffix-tokens 1024 --output-tokens 16
+```
+
+脚本先生成共享前缀的 KV，等待异步写回，再清空设备前缀缓存、保留主机缓存，随后发送前缀加后缀请求。前缀长度建议为 128 的倍数，输入与输出 token 总数不能超过 `MAX_MODEL_LEN`。
+
+常用选项：
+
+| 选项 | 用途 |
+|---|---|
+| `--prefix-tokens` / `--suffix-tokens` | 指定共享前缀和新增后缀的 token 数 |
+| `--output-tokens` | 指定生成 token 数 |
+| `--repeat` | 重复发送目标请求 |
+| `--store-wait` | 设置主机写回等待秒数 |
+| `--no-device-reset` | 保留设备前缀缓存 |
+| `--output` | 将请求结果保存为 JSON |
+| `--url` / `--model` | 覆盖服务地址和模型名称 |
+
+```bash
+./query.sh --prefix-tokens 6144 --suffix-tokens 2048 \
+  --output-tokens 16 --output runs/request.json
+```
+
+该示例需先将 `MAX_MODEL_LEN` 设为至少 8208。结果包含实际 token 数、TTFT、TPOT、总时延和响应文本；缓存重置是否成功可结合服务日志和实际重载记录确认。
+
+### 6. 配置参考
 
 | 参数 | 含义 |
 |---|---|
-| MODEL_PATH / MODEL_NAME | 模型目录和 API 模型名称 |
-| DEVICE_IDS / TP_SIZE | 可见 NPU 编号与张量并行度 |
-| PP_SIZE | 流水线并行度，默认 1 |
-| DISTRIBUTED_EXECUTOR_BACKEND | 分布式执行后端，默认 mp；本项目多机部署使用 ray |
-| HOST / PORT | 服务监听地址和端口 |
-| MAX_MODEL_LEN | 输入加输出 token 总长度上限 |
-| MAX_NUM_BATCHED_TOKENS | 单步 token 预算 |
-| MAX_NUM_SEQS | 最大并发序列数；已验证 2 |
-| GPU_MEMORY_UTILIZATION | 设备内存使用比例 |
-| NUM_CPU_BLOCKS | 主机 KV 缓存块数 |
-| COMPUTE_CHUNK / LOAD_CHUNK | 计算与加载粒度，必须为正的 128 倍数 |
-| PREFIX_TOKENS / SUFFIX_TOKENS | 请求脚本默认前后缀 token 数 |
-| SERVE_MODE | runtime 使用项目连接器；plain 使用原生 vLLM 且不预加载本地库 |
-| ENABLE_H2D / ENABLE_D2H | 本地库钩子开关；Python 连接器仍管理传输任务 |
-| GHASH_LIBRARY / AIV_KEYSTREAM_LIBRARY | 认证库默认使用项目内构建的 AICPU 库；可选 AIV 密钥流后端 |
-| ASCEND_ROOT | CANN 目录；为空时在容器中自动查找 |
-| PYTHON | 容器内的 Python 解释器 |
-| BASE_IMAGE / IMAGE | 基础镜像和构建镜像名称 |
-| CONTAINER_NAME | 可选固定容器名称 |
-| RESULT_DIR | 结果目录，默认 runs/current |
+| `MODEL_PATH` / `MODEL_NAME` | 本地模型目录与 API 模型名称 |
+| `DEVICE_IDS` | 可见 NPU 编号，多个编号用逗号分隔 |
+| `TP_SIZE` / `PP_SIZE` | 张量并行度与流水线并行度 |
+| `DISTRIBUTED_EXECUTOR_BACKEND` | 执行后端，单机默认 `mp` |
+| `HOST` / `PORT` | 服务监听地址与端口 |
+| `MAX_MODEL_LEN` | 单请求输入与输出 token 总长度上限 |
+| `MAX_NUM_BATCHED_TOKENS` | 单步调度 token 预算 |
+| `MAX_NUM_SEQS` | 服务端最大并发序列数；客户端发送并发需另行设置 |
+| `GPU_MEMORY_UTILIZATION` | 设备内存预算比例 |
+| `NUM_CPU_BLOCKS` | 主机 KV 池块数 |
+| `COMPUTE_CHUNK` / `LOAD_CHUNK` | 前缀重算与重载粒度，单位为 token |
+| `SERVE_MODE` | `runtime` 使用安全传输和复用模块；`plain` 使用原生 vLLM |
+| `ENABLE_H2D` / `ENABLE_D2H` | `runtime` 模式下两个传输方向的密码钩子开关 |
+| `RESULT_DIR` | 运行记录目录，默认 `runs/current` |
+| `GHASH_LIBRARY` | AICPU 认证库路径，默认使用项目内构建产物 |
+| `AIV_KEYSTREAM_LIBRARY` | 可选设备密钥流后端路径 |
+| `ASCEND_ROOT` / `PYTHON` | CANN 安装目录与 Python 解释器 |
+| `BASE_IMAGE` / `IMAGE` | Docker 基础镜像与项目镜像名称 |
+| `CONTAINER_NAME` | 可选的固定容器名称 |
 
-.env、权重、日志和编译产物不提交到版本库。部署路径只写入本地 .env。可选设备库放入项目目录后可配置为项目相对路径。
+`.env`、模型权重、运行日志和构建产物保留在本地。
 
-## 单机 TP
+### 7. 常见问题
 
-完整 PACI 已在 Qwen2.5-72B、TP=4、PP=1 上验证，包括安全 D2H 回写、C1 预取与设备密钥流、逐层认证、固定 q 和控制器自动选 q，以及两个并发请求。配置 `DEVICE_IDS=4,5,6,7`、`TP_SIZE=4`、`PP_SIZE=1`、`MAX_NUM_SEQS=2`，并将 `MODEL_PATH` 指向对应模型。
-
-每个 rank 独立维护密码会话与分片 KV；主机缓存发布与重载退休等待所有 rank 完成。每个批次的 attention 等待批次内相关请求各自的层 KV 就绪。多个请求共用一个有序密码提交器，当前验证的是功能正确性，尚未评估并发吞吐收益。计算模型仅使用单请求批次的完成观测，并在 TP rank 间取最慢观测。
-
-## 多机 PP 部署
-
-服务入口支持 `PP_SIZE`、`TP_SIZE` 和 `DISTRIBUTED_EXECUTOR_BACKEND`。PP=2、TP=8 对应两台八卡服务器共同运行一个模型，每台负责一段模型层，节点内八卡做张量并行。
-
-[多机启动步骤](deploy/pp4_tp8/README.md)包含 Ray 节点启动、模型挂载和服务入口。已用 DeepSeek-R1-Distill-Llama-70B 的真实 BF16 权重验证两机16卡原生明文 PP 推理。该部署路径使用 `SERVE_MODE=plain`；PACI 的 connector、认证和 controller 的 PP 配合不属于本次验证范围。
-
-## 构造前缀和后缀
-
-请求脚本调用服务端 tokenizer，用 token ID 数组精确构造输入。每次先发送只有共享前缀的请求，等待异步 D2H 写回，再调用 `/reset_prefix_cache?reset_external=false` 清空设备缓存并保留主机缓存，清空前发送两个不足一个 KV 块的短请求，让调度器处理前序请求的完成通知。最后测量“共享前缀 + 后缀”。输出通过 ignore_eos 固定 token 数。服务入口默认设置 `VLLM_SERVER_DEV_MODE=1` 以启用此实验接口。
-
-~~~bash
-./manage.sh query --prefix-tokens 512 --suffix-tokens 512 --output-tokens 16
-
-./manage.sh query --prefix-tokens 256 --suffix-tokens 1024 --output-tokens 16
-
-# 6K 前缀、8K 后缀：先将 MAX_MODEL_LEN 设为至少 14352 并重启
-./manage.sh query --prefix-tokens 6144 --suffix-tokens 8192 --output-tokens 16 --output runs/p6144_s8192.json
-~~~
-
-服务外部也可直接用 Python 标准库发送请求：
-
-~~~bash
-python3 request.py --url http://127.0.0.1:8080 --model secure-infer --prefix-tokens 512 --suffix-tokens 1024
-~~~
-
-PREFIX_TOKENS 和 SUFFIX_TOKENS 仅设置请求脚本默认值；控制器按真实缓存匹配确定命中长度。缓存块大小为 128 tokens，建议前缀采用 128 的倍数。输入加输出长度必须小于等于 MAX_MODEL_LEN。
-
-输出包含实际输入和输出 token 数、TTFT、TPOT、端到端总时延和响应文本。TTFT 从发起 HTTP 请求到首个非空文本块，TPOT 根据首末文本块时间和服务端输出 token 数计算，总时延计到流式完成标记。流式块可能合并 token，因此为客户端观测口径。
-
-`--store-wait 8` 设置写回等待秒数。每次重复前都会清空设备缓存。`--no-device-reset` 可用于设备缓存命中测试。HTTP 200 不代表设备缓存一定清空成功：异步任务尚未释放块时，vLLM 可能拒绝清空。测量时需结合服务日志中的成功清空记录、实际 host-cache match 和 H2D 加载记录确认路径。脚本为每次目标请求生成不同的后缀，避免重复命中已写回的后缀 KV；仍需按实际缓存命中长度核对。
-
-## 明文对照
-
-保持模型、设备、上下文与请求参数一致，分别将 .env 中 SERVE_MODE 设置为 runtime 和 plain，停止并重启服务后测量：
-
-~~~bash
-./start.sh
-./manage.sh query --prefix-tokens 512 --suffix-tokens 1024 --output runs/result.json
-./manage.sh stop
-~~~
-
-两个模式分别完成预热，使用相同输出长度和缓存预热/驱逐流程。
-
-## 实现与实验进度
-
-GCM 会话密钥通过主机与 AICPU 的临时 X25519 密钥交换分别在两端派生，密钥和设备密钥流不作为 PCIe 传输数据。当前交换尚未认证设备身份，依赖可信设备配给假设。
-
-runtime 启动入口默认使用 AES-GCM、预测性主机加密、设备密钥流预计算和异步 D2H 两阶段发布。每层通过认证和设备写入完成检查后才使用其 KV；注册的 KV 范围内，小于旧大小阈值的拷贝也经过密码路径。GCM 直接使用仓库自带的 AICPU 算子，不依赖旧的外部 AES-CTR 算子库。
-
-控制器增量读取已完成的设备观测；观测未改变时复用拟合结果，并批量计算候选切分点。控制器在预填充前选择一次切分点 q，执行中保持不变；前缀计算末块缩短至 q，尾部从开始就按层重载。异步加载、密钥流任务回收、D2H 发布依赖和多机 PP 启动接口均保留。
-
-设备身份认证尚未接入；当前 X25519 交换不验证设备证书。本轮不涉及压缩路径。
-
-## 2026-10-27 代码整理验证
-
-- CPU 回归测试覆盖控制器、逐层交接、异步发布、写入冲突和多 rank 元数据；运行 `./run_test.sh`。
-- NPU 算子测试覆盖主机/设备 AES-GCM 互验、预计算密钥流及篡改拒绝：
-
-~~~bash
-python3 secure_infer/tests/crypto_smoke.py \
-  --library secure_infer/native/kernels/aicpu/build/libruntime_aicpu_ghash.so --devices 0
-~~~
-
-- `native_registered_transfer_smoke.py` 验证 16、31、4096、32768、262144 字节注册 KV 拷贝；需预加载本地库并设置独立的 `PIPE_GCM_FAULT_EVENT_PATH`。设置 `PIPE_ENABLE_D2H=1` 可同时验证异步写回。
-- `serving_smoke.py` 在独立服务上比较完整 prefill 与主机前缀复用的生成结果，使用不同 `cache_salt` 保证参考请求不复用缓存，并清空设备缓存后验证 H2D 重载。它会修改该测试服务的缓存状态。
-- 构建命令、实机结果和控制器开销比较见 [本轮记录](docs/runtime_cleanup_20261027.md)。
-
-## 此前部署验证（未启用密码路径）
-
-- 本地库重新编译成功，17 项单元测试通过。
-- 使用新 start.sh 在 8 卡 70B 模型上完成启动，健康检查返回 HTTP 200。
-- 前缀 128 / 后缀 256、前缀 256 / 后缀 1024 两组请求均完整生成，实际输入长度分别为 384、1280 tokens。
-- 容器内 manage.sh query 和宿主机 Python 请求均已验证。
-- 验证沿用本机已有的 CANN 8.5、vLLM 0.14.1 环境镜像；Dockerfile 默认的公开基础镜像尚未在本轮重新拉取验证。
-- 本次运行保留 ENABLE_H2D=0、ENABLE_D2H=0 的原测试配置，未新增完整安全路径的性能结论。
+- **依赖或认证库找不到**：确认已加载 CANN 环境，`ASCEND_ROOT` 指向正确目录，再运行 `./configure.sh`。
+- **启动时设备内存不足**：确认设备上没有残留服务，按模型大小调整 TP 或设备内存预算。
+- **主机内存不足或初始化较慢**：减小 `NUM_CPU_BLOCKS`。主机 KV 池按模型层分配，大池需要更多内存及初始化时间。
+- **请求长度超限**：提高 `MAX_MODEL_LEN` 后重新启动，或缩短输入及输出。
+- **主机缓存没有复用**：确认前缀相同、写回已完成且设备缓存已清空；检查实际 host-cache match 与 H2D 重载日志。
+- **需要从另一台机器访问**：使用 SSH 端口转发，将本地端口映射到服务器的 `127.0.0.1:8080`；API 请求中的模型名称须与 `MODEL_NAME` 一致。
