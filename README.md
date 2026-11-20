@@ -108,7 +108,29 @@ source /path/to/nnal/atb/set_env.sh
 
 `configure.sh` 检查 Python 依赖，构建 `libsecure_infer.so`，并在 `runtime` 模式下构建 AICPU 认证算子。`run.sh` 加载配置并在前台启动服务，按 `Ctrl+C` 停止。
 
-### 4. 张量并行
+### 4. KV 压缩和复用策略
+
+配置模型后，可通过同一个入口运行 TPSR 和 Cake。
+
+```bash
+KV_CODEC_OVERRIDE=int4 ./run.sh
+REUSE_POLICY_OVERRIDE=cake KV_CODEC_OVERRIDE=int4 ./run.sh
+```
+
+在 `.env` 中设置以下选项。临时切换时可在对应变量名后加 `_OVERRIDE`，如上面的命令。
+
+| 选项 | 配置 |
+| --- | --- |
+| `REUSE_POLICY` | `tpsr` 在线估计各切分点的 TTFT 并选择 `q`。 `cake` 从前向后重算、从后向前加载，两端会合时确定 `q`。Cake 默认关闭 TPSR 的预测性加密。 |
+| `KV_CODEC` | `none` 保留原始精度，`int8` 和 `int4` 为定点量化，`mixed` 为分层混合精度。默认 `none`。 |
+| `KV_STAGE_PIPELINE` | `1` 启用压缩 KV 的传输、认证和解压流水，`0` 在同一加载路径上依次执行。 |
+| `KV_RECOVERY_PIPELINE` | TPSR 使用 `1` 在各层恢复完成后释放对应层计算，使用 `0` 等待全部层。Cake 在每个加载块的各层都恢复后推进加载位置。 |
+
+压缩在异步写回主机时完成。加载使用主机中已有的压缩块，设备先认证，再解压并写入 KV Cache。若 ASCEND 环境安装了备用的 AI Core AES-CTR 算子，可在 `AES_CTR_LIBRARY` 中配置其共享库路径。
+
+启动服务后使用 `request.py` 指定相同的前缀和后缀长度。服务侧的 `reuse_timeline.jsonl` 记录 TPSR 的入口选点（`entry_cost_decision`）或 Cake 的会合位置（`cake_meet`），`device_timeline.jsonl` 记录设备各步的耗时。
+
+### 5. 张量并行
 
 单机四卡 TP 示例，在 `.env` 中设置：
 
@@ -125,7 +147,7 @@ MAX_NUM_SEQS=1
 
 多机原生明文推理的 Ray/PP 部署步骤见 [多机部署指南](deploy/pp4_tp8/README.md)。
 
-### 5. 发送请求
+### 6. 发送请求
 
 服务提供 OpenAI 兼容的 completions 接口，可直接发送普通文本：
 
@@ -174,7 +196,7 @@ curl --fail http://127.0.0.1:8080/v1/completions \
 
 该示例需先将 `MAX_MODEL_LEN` 设为至少 8208。结果包含实际 token 数、TTFT、TPOT、总时延和响应文本；缓存重置是否成功可结合服务日志和实际重载记录确认。
 
-### 6. 配置参考
+### 7. 配置参考
 
 | 参数 | 含义 |
 |---|---|
@@ -200,7 +222,7 @@ curl --fail http://127.0.0.1:8080/v1/completions \
 
 `.env`、模型权重、运行日志和构建产物保留在本地。
 
-### 7. 常见问题
+### 8. 常见问题
 
 - **依赖或认证库找不到**：确认已加载 CANN 环境，`ASCEND_ROOT` 指向正确目录，再运行 `./configure.sh`。
 - **启动时设备内存不足**：确认设备上没有残留服务，按模型大小调整 TP 或设备内存预算。

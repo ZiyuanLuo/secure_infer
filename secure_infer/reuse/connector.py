@@ -1,4 +1,5 @@
-"""Static suffix-aware prefix reuse on native layerwise secure reload."""
+"""Suffix-aware prefix reuse with layerwise secure reload."""
+import json
 from dataclasses import dataclass, field, replace
 import os
 import threading
@@ -40,6 +41,17 @@ class RuntimeStorageScheduler(NativeScheduler):
         self.scale_scheduler_config=config
         self.ordinary_prefill_threshold=config.long_prefill_token_threshold
 
+    def backlog(self,rid):
+        total=0
+        sched=getattr(self,'sched_ref',None)
+        for request in (sched.running if sched else []):
+            if request.request_id==rid:continue
+            state=self.reuse_requests.get(request.request_id)
+            if state and not state['suffix_started']:
+                total+=max(0,state['q']-request.num_computed_tokens)+max(0,request.num_prompt_tokens-state['R'])
+            else:total+=max(0,request.num_prompt_tokens-request.num_computed_tokens)
+        return total
+
     def get_num_new_matched_tokens(self,request,num_computed_tokens):
         if request.request_id in self.preempted_loads:
             # Its earlier load may still be in flight; recompute instead of
@@ -52,7 +64,11 @@ class RuntimeStorageScheduler(NativeScheduler):
         # split applies to the host-resident tokens that follow it.
         base=num_computed_tokens
         suffix=request.num_prompt_tokens-base-tokens
-        decision=entry_gate.choose(tokens,suffix,CHUNK,self.entry_layers,base)
+        step_tokens=self.scale_scheduler_config.max_num_batched_tokens
+        if self.ordinary_prefill_threshold>0:
+            step_tokens=min(step_tokens,self.ordinary_prefill_threshold)
+        decision=entry_gate.choose(tokens,suffix,CHUNK,self.entry_layers,base,
+                                   pending=self.backlog(request.request_id),step_tokens=step_tokens)
         trace('entry_cost_decision',request_id=request.request_id,N=tokens,
               U=suffix,D=base,**decision)
         if decision['policy']=='load':return tokens,False
@@ -105,6 +121,8 @@ class RuntimeScheduler(Scheduler):
     def __init__(self,*args,**kwargs):
         super().__init__(*args,**kwargs)
         self.ordinary_prefill_threshold=self.scheduler_config.long_prefill_token_threshold
+        cs=self.connector.connector_scheduler if self.connector else None
+        if cs is not None:cs.sched_ref=self
 
     def _preempt_request(self,request,timestamp):
         # vLLM frees a preempted request's blocks without telling the reload
@@ -149,7 +167,8 @@ class RuntimeScheduler(Scheduler):
                 total=getattr(request,"num_prompt_tokens",None)
                 if total is None:
                     total=state['R'] if state else request.num_computed_tokens
-                needed=max(0,total-request.num_computed_tokens-num_new_tokens)
+                computed=(request.num_computed_tokens+kwargs.get("num_new_computed_tokens",0)+kwargs.get("num_external_computed_tokens",0))
+                needed=max(0,total-computed-num_new_tokens)
                 kwargs['num_lookahead_tokens']=max(kwargs.get('num_lookahead_tokens',0),needed)
             return allocate(request,num_new_tokens,*args,**kwargs)
         self.kv_cache_manager.allocate_slots=allocate_for_tail
@@ -166,6 +185,8 @@ class RuntimeWorker(NativeWorker):
         self.newly_done=set()
         self.consuming={}
         self.submission_lock=threading.Lock()
+        self.load_failure=None
+        self.started_recovery_codecs=set()
 
     def snapshot(self,state):
         return dict(q=state['q'],done=state['done'],error=state['error'],
@@ -183,8 +204,11 @@ class RuntimeWorker(NativeWorker):
                     if not state['events']:break
                     layer,event=state['events'].popleft()
                 event.synchronize()
-                assert self.wait_auth(layer)==0,'Authentication failure blocks consumption'
-                if os.environ.get('RUNTIME_CHECK_LOADED_BYTES')=='1':
+                if not state['staged_recovery']:
+                    assert self.wait_auth(layer)==0,'Authentication failure blocks consumption'
+                else:
+                    assert state['authenticated'][layer]
+                if state.get('check_loaded_bytes',False):
                     source=torch.as_tensor(state['source'][state['q']//128:],dtype=torch.long)
                     destination=torch.as_tensor(state['destination'][state['q']//128:],dtype=torch.long)
                     for host,device in zip(self.handler.cpu_tensors[layer],self.handler.npu_tensors[layer]):
@@ -203,37 +227,81 @@ class RuntimeWorker(NativeWorker):
     def fetch(self,req_id,state):
         # NativeTransfer and crypto prediction scope are shared by this worker.
         # Queue requests through one submitter while compute batches run concurrently.
-        with self.submission_lock:
-            self.fetch_serialized(req_id,state)
+        with self.submission_lock,self.codec_store.io_lock:
+            try:
+                if self.load_failure is not None:
+                    raise RuntimeError(self.load_failure)
+                self.fetch_serialized(req_id,state)
+            except BaseException as error:
+                with self.lock:
+                    state['error']=repr(error)
+                    self.lock.notify_all()
+            if state['error']:
+                self.load_failure=state['error']
 
     def fetch_serialized(self,req_id,state):
+        layer_costs=[]
+        mode,pipeline=state['codec'],state['recovery_pipeline']
+        config_path=os.environ.get('KV_CODEC_CONFIG')
+        check_loaded_bytes=os.environ.get('RUNTIME_CHECK_LOADED_BYTES')=='1'
+        if config_path:
+            with open(config_path, encoding='utf-8') as config_file:
+                check_loaded_bytes |= bool(json.load(config_file).get('check_loaded_bytes'))
+        state['check_loaded_bytes']=mode=='none' and check_loaded_bytes
+        self.codec_adapter.mode=mode
+        self.codec_adapter.layers=len(self.names)
+        self.codec_adapter.request_id=req_id
+        trace('codec_configuration',request_id=req_id,codec=mode,recovery_pipeline=pipeline)
+        staged=state['staged_recovery']
+        def recovered(layer,event,start):
+            with self.lock:
+                state['authenticated'][layer]=True
+                state['ready_events'][layer]=event
+                state['events'].append((layer,event))
+                layer_costs.append((start,event))
+                self.lock.notify_all()
+        def recovery_error(error):
+            with self.lock:
+                state['error']=error
+                self.lock.notify_all()
         observer=threading.Thread(target=self.observe_layers,args=(req_id,state),daemon=True)
         try:
             torch.npu.set_device(self.handler.npu_tensors[0][0].device)
             observer.start()
+            if staged:
+                self.codec_adapter.start_request(req_id,mode,len(self.names),recovered,recovery_error)
             start,end=state['q'],state['R']
             mapping=np.column_stack((state['source'][start//128:end//128],
                                     state['destination'][start//128:end//128])).astype(np.int64)
             tensor=torch.from_numpy(mapping)
             self.ops.retained.append(tensor)
             trace('fetch_claim',request_id=req_id,start=start,end=end,execution_order='layer')
+            producer_event=state['producer_event']
+            self.native.load_stream.wait_event(producer_event)
+            for stream in self.ops.streams:
+                stream.wait_event(producer_event)
             with torch.npu.stream(self.native.load_stream):
                 for layer in range(len(self.names)):
                     with self.lock:
                         if state['error']:raise RuntimeError(state['error'])
                     self.ops.layer=layer
                     self.ops.causal_group_blocks=FETCH//128
+                    load_start=torch.npu.Event(enable_timing=True)
+                    load_start.record(self.native.load_stream)
+                    self.codec_adapter.load_start=load_start
                     self.ops.single_layer_kv_transfer((self.handler.cpu_tensors[layer],tensor),
                         self.native.kvcaches[layer])
-                    event=torch.npu.Event()
-                    event.record(self.native.load_stream)
+                    if not staged:
+                        event=torch.npu.Event(enable_timing=True)
+                        event.record(self.native.load_stream)
+                        layer_costs.append((load_start,event))
                     log('load_submissions.jsonl',dict(request_id=req_id,layer=layer,
                         start=start,end=end,records=2*len(mapping)))
-                    with self.lock:
-                        state['events'].append((layer,event))
-                        self.lock.notify_all()
-            _retire_h2d_prediction_scope()
-            self.retain_copy_inputs()
+                    if not staged:
+                        with self.lock:
+                            state['events'].append((layer,event))
+                            self.lock.notify_all()
+            if staged:self.codec_adapter.finish_request()
         except BaseException as error:
             with self.lock:
                 state['error']=repr(error)
@@ -244,8 +312,25 @@ class RuntimeWorker(NativeWorker):
                 state['submissions_done']=True
                 self.lock.notify_all()
             if observer.is_alive():observer.join(timeout=120)
+            if staged and state['error']:
+                self.codec_adapter.abort_request()
+                self.native.load_stream.synchronize()
+            if not state['error'] and not observer.is_alive():
+                self.codec_adapter.flush()
+                _retire_h2d_prediction_scope()
+                self.retain_copy_inputs()
             with self.lock:
                 if observer.is_alive():state['error']='authentication observer timeout'
+                if not state['error'] and len(layer_costs)==len(self.names):
+                    startup = staged and mode not in self.started_recovery_codecs
+                    if staged:
+                        self.started_recovery_codecs.add(mode)
+                    ready_ms = [layer_costs[0][0].elapsed_time(end) for _,end in layer_costs] if staged else []
+                    log('controller_load_costs.jsonl',dict(request_id=req_id,codec=mode,pipeline=pipeline,
+                        tokens=state['R']-state['q'],layers=len(self.names),
+                        service_ms=ready_ms[-1] if staged else sum(a.elapsed_time(b) for a,b in layer_costs),
+                        staged_recovery=staged,startup=startup,ready_ms=ready_ms,
+                        stage='transfer_authentication_recovery'))
                 state['done']=True
                 self.newly_done.add(req_id)
                 trace('fetch_done',request_id=req_id,**self.snapshot(state))
@@ -268,8 +353,15 @@ class RuntimeWorker(NativeWorker):
         super().start_kv_transfers(metadata)
         for req_id,kick in kickoff.items():
             assert req_id not in self.load_jobs
-            state=dict(**kick,done=False,error=None,verified=[kick['R'] for _ in self.names],
-                events=deque(),submissions_done=False)
+            from secure_infer.kv_offload.transport_codec import settings
+            codec,pipeline=settings()
+            staged=bool(int(os.environ.get('KV_STAGE_PIPELINE','1'))) and codec!='none'
+            producer_event=torch.npu.Event()
+            producer_event.record(torch.npu.current_stream())
+            state=dict(**kick,done=False,error=None,codec=codec,producer_event=producer_event,
+                verified=[kick['R'] for _ in self.names],
+                events=deque(),submissions_done=False,staged_recovery=staged,recovery_pipeline=pipeline,
+                ready_events=[None]*len(self.names),authenticated=[False]*len(self.names))
             self.load_jobs[req_id]=state
             state['thread']=threading.Thread(target=self.fetch,args=(req_id,state),daemon=True)
             state['thread'].start()
@@ -289,8 +381,23 @@ class RuntimeWorker(NativeWorker):
         # must have authenticated KV for this layer before it can run.
         for req_id,state in self.consuming.items():
             begin=time.monotonic_ns()
+            if state['staged_recovery']:
+                with self.lock:
+                    required=layer if state['recovery_pipeline'] else len(self.names)-1
+                    while state['ready_events'][required] is None and not state['error']:
+                        self.lock.wait(timeout=30)
+                    assert not state['error'],state['error']
+                    assert state['authenticated'][required]
+                    ready=state['ready_events'][required]
+                # The verifier has succeeded. Device ordering, rather than a
+                # CPU event synchronize, makes the restored KV visible to attention.
+                torch.npu.current_stream().wait_event(ready)
+                trace('native_layer_wait_end',request_id=req_id,layer=layer,
+                    wait_ns=time.monotonic_ns()-begin,authenticated=True,write_dependency_queued=True)
+                continue
             with self.lock:
-                while state['verified'][layer]>state['q'] and not state['error']:
+                while (state['verified'][layer]>state['q'] or
+                       (not state.get('recovery_pipeline',True) and any(v>state['q'] for v in state['verified']))) and not state['error']:
                     self.lock.wait(timeout=30)
                 assert not state['error'],state['error']
                 assert state['verified'][layer]==state['q']

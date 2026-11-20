@@ -1,4 +1,5 @@
 """Start the configured vLLM server with the runtime connector."""
+import json
 import os
 import sys
 import subprocess
@@ -10,6 +11,7 @@ def main() -> int:
     if not model:
         raise SystemExit("MODEL_PATH is required")
     root = Path(__file__).resolve().parents[2]
+    mode = os.environ.get("SERVE_MODE", "runtime")
     cmd = [
         "vllm", "serve", model,
         "--host", os.environ.get("HOST", "127.0.0.1"),
@@ -23,15 +25,30 @@ def main() -> int:
         "--max-num-batched-tokens", os.environ.get("MAX_NUM_BATCHED_TOKENS", "16384"),
         "--gpu-memory-utilization", os.environ.get("GPU_MEMORY_UTILIZATION", "0.61"),
         "--enable-chunked-prefill", "--enforce-eager", "--block-size", "128",
-        "--scheduler-cls", "secure_infer.reuse.connector.RuntimeScheduler",
-        "--kv-transfer-config",
-        '{"kv_connector":"RuntimeConnector","kv_connector_module_path":"secure_infer.reuse.connector","kv_role":"kv_both","kv_connector_extra_config":{"num_cpu_blocks":%s,"block_size":128,"spec_name":"NPUOffloadingSpec","spec_module_path":"secure_infer.kv_offload.npu_predict"}}'
-        % os.environ.get("NUM_CPU_BLOCKS", "512"),
     ]
-    mode = os.environ.get("SERVE_MODE", "runtime")
-    if mode == "plain":
-        del cmd[cmd.index("--scheduler-cls"):]
-    elif mode != "runtime":
+    if mode == "runtime":
+        policy = os.environ.get("REUSE_POLICY", "tpsr")
+        modules = {
+            "tpsr": "secure_infer.reuse.connector",
+            "cake": "secure_infer.reuse.cake_connector",
+        }
+        if policy not in modules:
+            raise SystemExit("REUSE_POLICY must be tpsr or cake")
+        module = modules[policy]
+        transfer = {
+            "kv_connector": "RuntimeConnector",
+            "kv_connector_module_path": module,
+            "kv_role": "kv_both",
+            "kv_connector_extra_config": {
+                "num_cpu_blocks": int(os.environ.get("NUM_CPU_BLOCKS", "512")),
+                "block_size": 128,
+                "spec_name": "NPUOffloadingSpec",
+                "spec_module_path": "secure_infer.kv_offload.npu_predict",
+            },
+        }
+        cmd.extend(("--scheduler-cls", f"{module}.RuntimeScheduler",
+                    "--kv-transfer-config", json.dumps(transfer)))
+    elif mode != "plain":
         raise SystemExit("SERVE_MODE must be runtime or plain")
     cmd.extend(sys.argv[1:])
     env = os.environ.copy()

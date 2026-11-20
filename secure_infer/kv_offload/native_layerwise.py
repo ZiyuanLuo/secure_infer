@@ -156,6 +156,8 @@ class NativeWorker(SecureInferOffloadingConnectorWorker):
         self.names=list(caches)
 
         self.handler=self.spec._handler
+        from .transport_codec import install_store
+        self.codec_store=install_store(self.handler)
         # The store submitter runs on another host thread. Capture the actual
         # producer stream before queueing; a background thread's default stream
         # does not order D2H after the foreground model writes.
@@ -178,5 +180,9 @@ class NativeWorker(SecureInferOffloadingConnectorWorker):
         self.ops.causal_group_blocks=int(os.environ.get("RUNTIME_LOAD_CHUNK","2048"))//128
         self.native=SimpleNamespace(num_layers=len(caches),load_stream=self.handler.h2d_stream,
             kvcaches=self.handler.npu_tensors)
+        from .transport_codec import attach
+        self.codec_adapter=attach(self.ops,self.codec_store)
+        self.codec_adapter.layers=len(self.names)
+        self.codec_adapter.prepare(self.native.kvcaches)
         from secure_infer.reuse.timing_hooks import install
         install(self)

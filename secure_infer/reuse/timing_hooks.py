@@ -37,7 +37,7 @@ def install(worker):
     _installed=True
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
     from secure_infer.kv_offload.native_layerwise import NativeTransfer
-    from .connector import RuntimeWorker
+    worker_cls=type(worker)
     old_execute=NPUModelRunner.execute_model
     old_forward=NPUModelRunner._model_forward
     def execute(self,scheduler_output,*args,**kwargs):
@@ -117,4 +117,4 @@ def install(worker):
                 host_callback_ms=(time.monotonic_ns()-host_start)/1e6))
             return result
         return wait
-    RuntimeWorker.wait_for_layer_load=wrap_wait(RuntimeWorker.wait_for_layer_load)
+    worker_cls.wait_for_layer_load=wrap_wait(worker_cls.wait_for_layer_load)
